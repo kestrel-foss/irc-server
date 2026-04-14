@@ -418,8 +418,16 @@ sub _handle_client_line {
   my $command = $message->{command};
   my @params = @{$message->{params} || []};
 
+  if ($command eq 'CAP') {
+    $self->_handle_cap_command($client_id, \@params);
+    return 1;
+  }
+
   if ($command eq 'NICK') {
-    return 1 unless @params >= 1 && defined $params[0] && length $params[0];
+    if (!@params || !defined $params[0] || !length $params[0]) {
+      $self->_send_nonickname_given($client_id);
+      return 1;
+    }
     my $requested_nick = $params[0];
 
     if ($client->{registered}) {
@@ -442,6 +450,7 @@ sub _handle_client_line {
         new_nick => $new_nick,
       );
       $self->_assign_client_nick($client_id, $new_nick);
+      $self->_ensure_client_dm_subscription($client_id);
       $self->_emit_client_input(
         $client,
         {
@@ -456,7 +465,15 @@ sub _handle_client_line {
       return 1;
     }
 
-    return 1 if defined $client->{nick} && $client->{nick} eq $requested_nick;
+    if (defined $client->{nick}
+        && defined $self->_nick_key($client->{nick})
+        && defined $self->_nick_key($requested_nick)
+        && $self->_nick_key($client->{nick}) eq $self->_nick_key($requested_nick)) {
+      $self->_assign_client_nick($client_id, $requested_nick);
+      $self->_register_client_if_ready($client);
+      return 1;
+    }
+
     if ($self->_nick_in_use($requested_nick, exclude_client_id => $client_id)) {
       $self->_send_nick_in_use($client_id, $requested_nick);
       return 1;
@@ -469,15 +486,14 @@ sub _handle_client_line {
 
   if ($command eq 'USER') {
     return 1 if $client->{registered};
-    return 1 unless @params >= 4;
+    if (@params < 4) {
+      $self->_send_need_more_params($client_id, 'USER');
+      return 1;
+    }
 
     $client->{username} = $params[0];
     $client->{realname} = $params[3];
     $self->_register_client_if_ready($client);
-    return 1;
-  }
-
-  if (!$client->{registered}) {
     return 1;
   }
 
@@ -487,11 +503,71 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'QUIT') {
+    my $reason = @params >= 1 ? $params[0] : undef;
+    $self->_disconnect_client(
+      $client_id,
+      emit_quit => 1,
+      reason    => $reason,
+    );
+    return 1;
+  }
+
+  if (!$client->{registered}) {
+    if ($self->_command_requires_registration($command)) {
+      $self->_send_not_registered($client_id);
+      return 1;
+    }
+
+    $self->_send_unknown_command($client_id, $command);
+    return 1;
+  }
+
+  if ($command eq 'MODE') {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'MODE');
+      return 1;
+    }
+    my $target = $params[0];
+    if ($self->_is_nick_name($target)) {
+      my $current_nick = $client->{nick};
+      if (defined $current_nick
+          && defined $self->_nick_key($current_nick)
+          && defined $self->_nick_key($target)
+          && $self->_nick_key($current_nick) eq $self->_nick_key($target)) {
+        $self->_send_user_mode_is($client_id);
+        return 1;
+      }
+    }
+
+    if (!$self->_is_channel_name($target)) {
+      $self->_send_no_such_channel($client_id, $target);
+      return 1;
+    }
+
+    my $channel = $self->_client_joined_channel_name($client, $target);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $target);
+      return 1;
+    }
+
+    $self->_send_channel_mode_is($client_id, $channel);
+    return 1;
+  }
+
   if ($command eq 'JOIN') {
-    return 1 unless @params >= 1;
-    my $channel = $params[0];
-    return 1 unless $self->_is_channel_name($channel);
-    return 1 if $client->{joined_channels}{$channel};
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'JOIN');
+      return 1;
+    }
+    my $channel_input = $params[0];
+    if (!$self->_is_channel_name($channel_input)) {
+      $self->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $channel = $self->_canonical_channel_name($channel_input);
+    return 1 if defined $self->_client_joined_channel_name($client, $channel_input);
 
     $self->_add_client_to_channel($client_id, $channel);
     $self->_ensure_channel_subscription($channel);
@@ -513,10 +589,38 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'NAMES') {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'NAMES');
+      return 1;
+    }
+    my $channel_input = $params[0];
+    if (!$self->_is_channel_name($channel_input)) {
+      $self->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $channel = $self->_canonical_channel_name($channel_input);
+    $self->_send_names_list($client_id, $channel);
+    return 1;
+  }
+
   if ($command eq 'PART') {
-    return 1 unless @params >= 1;
-    my $channel = $params[0];
-    return 1 unless $client->{joined_channels}{$channel};
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'PART');
+      return 1;
+    }
+    my $channel_input = $params[0];
+    if (!$self->_is_channel_name($channel_input)) {
+      $self->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $channel = $self->_client_joined_channel_name($client, $channel_input);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $channel_input);
+      return 1;
+    }
 
     my $reason = @params >= 2 ? $params[1] : undef;
     my $line = sprintf(':%s PART %s', $client->{nick}, $channel);
@@ -538,33 +642,81 @@ sub _handle_client_line {
     return 1;
   }
 
-  if ($command eq 'PRIVMSG' || $command eq 'NOTICE' || $command eq 'TOPIC') {
-    return 1 unless @params >= 2;
+  if ($command eq 'PRIVMSG' || $command eq 'NOTICE') {
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1]) {
+      $self->_send_need_more_params($client_id, $command);
+      return 1;
+    }
     my $target = $params[0];
-    return 1 unless $self->_is_channel_name($target);
-    return 1 unless $client->{joined_channels}{$target};
+
+    if ($self->_is_channel_name($target)) {
+      my $channel = $self->_client_joined_channel_name($client, $target);
+      unless (defined $channel) {
+        $self->_send_not_on_channel($client_id, $target);
+        return 1;
+      }
+
+      $self->_emit_client_input(
+        $client,
+        {
+          command => $command,
+          target  => $channel,
+          text    => $params[1],
+        },
+      );
+      return 1;
+    }
+
+    if (!$self->_is_nick_name($target)) {
+      $self->_send_no_such_nick($client_id, $target);
+      return 1;
+    }
+
+    my $target_nick = $self->_canonical_current_nick($target);
+    unless (defined $target_nick) {
+      $self->_send_no_such_nick($client_id, $target);
+      return 1;
+    }
 
     $self->_emit_client_input(
       $client,
       {
         command => $command,
-        target  => $target,
+        target  => $target_nick,
         text    => $params[1],
       },
     );
     return 1;
   }
 
-  if ($command eq 'QUIT') {
-    my $reason = @params >= 1 ? $params[0] : undef;
-    $self->_disconnect_client(
-      $client_id,
-      emit_quit => 1,
-      reason    => $reason,
+  if ($command eq 'TOPIC') {
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1]) {
+      $self->_send_need_more_params($client_id, 'TOPIC');
+      return 1;
+    }
+    my $target = $params[0];
+    if (!$self->_is_channel_name($target)) {
+      $self->_send_no_such_channel($client_id, $target);
+      return 1;
+    }
+    my $channel = $self->_client_joined_channel_name($client, $target);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $target);
+      return 1;
+    }
+
+    $self->_emit_client_input(
+      $client,
+      {
+        command => $command,
+        target  => $channel,
+        text    => $params[1],
+      },
     );
     return 1;
   }
 
+  $self->_send_unknown_command($client_id, $command);
   return 1;
 }
 
@@ -583,14 +735,225 @@ sub _register_client_if_ready {
       $client->{nick},
     ),
   );
+  $self->_ensure_client_dm_subscription($client->{id});
   return 1;
+}
+
+sub _handle_cap_command {
+  my ($self, $client_id, $params) = @_;
+  my @params = @{$params || []};
+  my $subcommand = defined $params[0] ? uc($params[0]) : '';
+
+  if ($subcommand eq 'LS') {
+    return $self->_send_client_line(
+      $client_id,
+      sprintf(':%s CAP * LS :', $self->{config}{server_name}),
+    );
+  }
+
+  if ($subcommand eq 'REQ') {
+    if (@params < 2 || !defined $params[1] || !length $params[1]) {
+      $self->_send_need_more_params($client_id, 'CAP');
+      return 1;
+    }
+
+    return $self->_send_client_line(
+      $client_id,
+      sprintf(':%s CAP * NAK :%s', $self->{config}{server_name}, $params[1]),
+    );
+  }
+
+  return 1 if $subcommand eq 'END';
+
+  $self->_send_unknown_command($client_id, 'CAP');
+  return 1;
+}
+
+sub _command_requires_registration {
+  my ($self, $command) = @_;
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE);
+}
+
+sub _send_unknown_command {
+  my ($self, $client_id, $command) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 421 %s %s :Unknown command',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $command,
+    ),
+  );
+}
+
+sub _send_nonickname_given {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 431 %s :No nickname given',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+    ),
+  );
+}
+
+sub _send_not_registered {
+  my ($self, $client_id) = @_;
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 451 * :You have not registered',
+      $self->{config}{server_name},
+    ),
+  );
+}
+
+sub _send_need_more_params {
+  my ($self, $client_id, $command) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 461 %s %s :Not enough parameters',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $command,
+    ),
+  );
+}
+
+sub _send_no_such_nick {
+  my ($self, $client_id, $nick) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 401 %s %s :No such nick/channel',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $nick,
+    ),
+  );
+}
+
+sub _send_no_such_channel {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 403 %s %s :No such channel',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+    ),
+  );
+}
+
+sub _send_not_on_channel {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 442 %s %s :You\'re not on that channel',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+    ),
+  );
+}
+
+sub _send_channel_mode_is {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 324 %s %s +n',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $display_channel,
+    ),
+  );
+}
+
+sub _send_user_mode_is {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 221 %s +',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+    ),
+  );
+}
+
+sub _client_numeric_target {
+  my ($self, $client) = @_;
+  return '*'
+    unless ref($client) eq 'HASH'
+      && defined $client->{nick}
+      && !ref($client->{nick})
+      && length($client->{nick});
+  return $client->{nick};
+}
+
+sub _irc_casefold {
+  my ($self, $value) = @_;
+  return undef unless defined $value && !ref($value);
+
+  my $folded = $value;
+  $folded =~ tr/A-Z[]\\^/a-z{}|~/;
+  return $folded;
+}
+
+sub _nick_key {
+  my ($self, $nick) = @_;
+  return undef unless defined $nick && !ref($nick) && length($nick);
+  return $self->_irc_casefold($nick);
+}
+
+sub _canonical_current_nick {
+  my ($self, $nick) = @_;
+  my $key = $self->_nick_key($nick);
+  return undef unless defined $key;
+
+  my $client_id = $self->{nick_to_client_id}{$key};
+  return undef unless defined $client_id && exists $self->{clients}{$client_id};
+  return $self->{clients}{$client_id}{nick};
 }
 
 sub _nick_in_use {
   my ($self, $nick, %args) = @_;
-  return 0 unless defined $nick && !ref($nick) && length($nick);
+  my $key = $self->_nick_key($nick);
+  return 0 unless defined $key;
 
-  my $owner = $self->{nick_to_client_id}{$nick};
+  my $owner = $self->{nick_to_client_id}{$key};
   return 0 unless defined $owner;
   return 0 if defined $args{exclude_client_id} && $owner eq $args{exclude_client_id};
   return 1;
@@ -600,6 +963,8 @@ sub _assign_client_nick {
   my ($self, $client_id, $nick) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
+  my $key = $self->_nick_key($nick);
+  return 0 unless defined $key;
 
   if (defined $client->{nick} && length($client->{nick}) && $client->{nick} ne $nick) {
     $self->_release_client_nick(
@@ -609,7 +974,7 @@ sub _assign_client_nick {
   }
 
   $client->{nick} = $nick;
-  $self->{nick_to_client_id}{$nick} = $client_id;
+  $self->{nick_to_client_id}{$key} = $client_id;
   return 1;
 }
 
@@ -622,11 +987,12 @@ sub _release_client_nick {
         ? $self->{clients}{$client_id}{nick}
         : undef
     );
-  return 0 unless defined $nick && !ref($nick) && length($nick);
-  return 0 unless exists $self->{nick_to_client_id}{$nick};
-  return 0 unless $self->{nick_to_client_id}{$nick} eq $client_id;
+  my $key = $self->_nick_key($nick);
+  return 0 unless defined $key;
+  return 0 unless exists $self->{nick_to_client_id}{$key};
+  return 0 unless $self->{nick_to_client_id}{$key} eq $client_id;
 
-  delete $self->{nick_to_client_id}{$nick};
+  delete $self->{nick_to_client_id}{$key};
   return 1;
 }
 
@@ -697,9 +1063,63 @@ sub _ensure_channel_subscription {
   return $subscription_id;
 }
 
+sub _ensure_client_dm_subscription {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return undef;
+  return undef unless $client->{registered};
+  return undef unless defined $client->{nick} && length($client->{nick});
+
+  my $object_id = $self->_dm_object_id($client->{nick});
+  if (defined $client->{dm_subscription_id}
+      && defined $client->{dm_object_id}
+      && $client->{dm_object_id} eq $object_id) {
+    return $client->{dm_subscription_id};
+  }
+
+  $self->_close_client_dm_subscription($client_id)
+    if defined $client->{dm_subscription_id};
+
+  my $subscription_id = 'dm:' . $client_id;
+  $self->_request(
+    method => 'subscriptions.open',
+    params => {
+      subscription_id => $subscription_id,
+      query           => {
+        overnet_ot  => 'chat.dm',
+        overnet_oid => $object_id,
+      },
+    },
+  );
+  $client->{dm_subscription_id} = $subscription_id;
+  $client->{dm_object_id} = $object_id;
+
+  return $subscription_id;
+}
+
+sub _close_client_dm_subscription {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 1;
+  return 1 unless defined $client->{dm_subscription_id};
+
+  my $subscription_id = delete $client->{dm_subscription_id};
+  delete $client->{dm_object_id};
+  $self->_request(
+    method => 'subscriptions.close',
+    params => {
+      subscription_id => $subscription_id,
+    },
+  );
+
+  return 1;
+}
+
 sub _close_channel_subscription {
   my ($self, $channel) = @_;
-  my $state = $self->{channels}{$channel}
+  my $channel_key = $self->_channel_key($channel);
+  return 1 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return 1;
   return 1 unless defined $state->{subscription_id};
 
@@ -719,30 +1139,34 @@ sub _add_client_to_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
   my $state = $self->_channel_state($channel);
-  $client->{joined_channels}{$channel} = 1;
+  $client->{joined_channels}{$channel_key} = $state->{channel_name};
   $state->{members}{$client_id} = 1;
-  $self->_add_visible_nick($channel, $client->{nick});
+  $self->_add_visible_nick($state->{channel_name}, $client->{nick});
   return 1;
 }
 
 sub _remove_client_from_channel {
   my ($self, $client_id, $channel, %opts) = @_;
   my $client = $self->{clients}{$client_id};
-  my $state = $self->{channels}{$channel}
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return 0;
   my $nick = defined $opts{nick}
     ? $opts{nick}
     : ($client ? $client->{nick} : undef);
 
-  delete $client->{joined_channels}{$channel}
+  delete $client->{joined_channels}{$channel_key}
     if $client;
   delete $state->{members}{$client_id};
-  $self->_remove_visible_nick($channel, $nick);
+  $self->_remove_visible_nick($state->{channel_name}, $nick);
 
   if (!keys %{$state->{members}}) {
-    $self->_close_channel_subscription($channel);
-    delete $self->{channels}{$channel};
+    $self->_close_channel_subscription($state->{channel_name});
+    delete $self->{channels}{$channel_key};
   }
 
   return 1;
@@ -750,11 +1174,11 @@ sub _remove_client_from_channel {
 
 sub _disconnect_client {
   my ($self, $client_id, %args) = @_;
-  my $client = delete $self->{clients}{$client_id}
+  my $client = $self->{clients}{$client_id}
     or return 1;
   my $current_nick = $client->{nick};
 
-  my @channels = sort keys %{$client->{joined_channels} || {}};
+  my @channels = sort values %{$client->{joined_channels} || {}};
   if ($args{emit_quit}) {
     my $line = sprintf(':%s QUIT', $client->{nick});
     $line .= ' :' . $args{reason}
@@ -795,6 +1219,7 @@ sub _disconnect_client {
     }
   }
 
+  $self->_close_client_dm_subscription($client_id);
   $self->_release_client_nick(
     $client_id,
     nick => $current_nick,
@@ -802,6 +1227,7 @@ sub _disconnect_client {
 
   close $client->{socket}
     if defined $client->{socket};
+  delete $self->{clients}{$client_id};
 
   return 1;
 }
@@ -883,12 +1309,47 @@ sub _render_subscription_item {
     my @client_ids = grep {
       exists $self->{clients}{$_}
         && $self->{clients}{$_}{registered}
-        && $self->{clients}{$_}{joined_channels}{$channel}
+        && defined $self->_client_joined_channel_name($self->{clients}{$_}, $channel)
     } sort keys %{$self->{clients}};
     return undef unless @client_ids;
 
     return {
       channel    => $channel,
+      line       => $line,
+      client_ids => \@client_ids,
+    };
+  }
+
+  if (($tags{overnet_ot} || '') eq 'chat.dm' && $item_type eq 'event') {
+    my $target_nick = $self->_dm_nick_from_object_id($tags{overnet_oid});
+    return undef unless defined $target_nick;
+
+    my $nick = $provenance->{external_identity};
+    return undef unless defined $nick && !ref($nick) && length($nick);
+
+    my $display_target_nick = $self->_canonical_current_nick($target_nick) || $target_nick;
+    my $line;
+    if ($event_type eq 'chat.dm_message') {
+      return undef unless defined $body->{text} && !ref($body->{text});
+      $line = sprintf(':%s PRIVMSG %s :%s', $nick, $display_target_nick, $body->{text});
+    } elsif ($event_type eq 'chat.dm_notice') {
+      return undef unless defined $body->{text} && !ref($body->{text});
+      $line = sprintf(':%s NOTICE %s :%s', $nick, $display_target_nick, $body->{text});
+    } else {
+      return undef;
+    }
+
+    my $target_key = $self->_nick_key($target_nick);
+    return undef unless defined $target_key;
+    my @client_ids = grep {
+      exists $self->{clients}{$_}
+        && $self->{clients}{$_}{registered}
+        && defined $self->_nick_key($self->{clients}{$_}{nick})
+        && $self->_nick_key($self->{clients}{$_}{nick}) eq $target_key
+    } sort keys %{$self->{clients}};
+    return undef unless @client_ids;
+
+    return {
       line       => $line,
       client_ids => \@client_ids,
     };
@@ -1151,12 +1612,48 @@ sub _first_tag_values {
 
 sub _channel_object_id {
   my ($self, $channel) = @_;
-  return 'irc:' . $self->{config}{network} . ':' . $channel;
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  return 'irc:' . $self->{config}{network} . ':' . $canonical;
+}
+
+sub _dm_object_id {
+  my ($self, $nick) = @_;
+  return 'irc:' . $self->{config}{network} . ':dm:' . $nick;
+}
+
+sub _channel_key {
+  my ($self, $channel) = @_;
+  return undef unless $self->_is_channel_name($channel);
+  return $self->_irc_casefold($channel);
+}
+
+sub _canonical_channel_name {
+  my ($self, $channel) = @_;
+  my $key = $self->_channel_key($channel);
+  return undef unless defined $key;
+  return $self->{channels}{$key}{channel_name}
+    if exists $self->{channels}{$key}
+      && defined $self->{channels}{$key}{channel_name}
+      && length($self->{channels}{$key}{channel_name});
+  return $channel;
+}
+
+sub _client_joined_channel_name {
+  my ($self, $client, $channel) = @_;
+  return undef unless ref($client) eq 'HASH';
+  my $key = $self->_channel_key($channel);
+  return undef unless defined $key;
+  return $client->{joined_channels}{$key};
 }
 
 sub _channel_state {
   my ($self, $channel) = @_;
-  return $self->{channels}{$channel} ||= {
+  my $key = $self->_channel_key($channel);
+  return undef unless defined $key;
+
+  return $self->{channels}{$key} ||= {
+    channel_name  => $channel,
     members       => {},
     visible_nicks => {},
   };
@@ -1164,24 +1661,33 @@ sub _channel_state {
 
 sub _add_visible_nick {
   my ($self, $channel, $nick) = @_;
-  return 0 unless defined $nick && !ref($nick) && length($nick);
+  my $nick_key = $self->_nick_key($nick);
+  return 0 unless defined $nick_key;
 
   my $state = $self->_channel_state($channel);
-  $state->{visible_nicks}{$nick} ||= 0;
-  $state->{visible_nicks}{$nick}++;
-  return $state->{visible_nicks}{$nick};
+  return 0 unless $state;
+  $state->{visible_nicks}{$nick_key} ||= {
+    count        => 0,
+    display_nick => $nick,
+  };
+  $state->{visible_nicks}{$nick_key}{display_nick} = $nick;
+  $state->{visible_nicks}{$nick_key}{count}++;
+  return $state->{visible_nicks}{$nick_key}{count};
 }
 
 sub _remove_visible_nick {
   my ($self, $channel, $nick) = @_;
-  return 0 unless defined $nick && !ref($nick) && length($nick);
-  my $state = $self->{channels}{$channel}
+  my $nick_key = $self->_nick_key($nick);
+  return 0 unless defined $nick_key;
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return 0;
-  return 0 unless exists $state->{visible_nicks}{$nick};
+  return 0 unless exists $state->{visible_nicks}{$nick_key};
 
-  $state->{visible_nicks}{$nick}--;
-  delete $state->{visible_nicks}{$nick}
-    if $state->{visible_nicks}{$nick} <= 0;
+  $state->{visible_nicks}{$nick_key}{count}--;
+  delete $state->{visible_nicks}{$nick_key}
+    if $state->{visible_nicks}{$nick_key}{count} <= 0;
   return 1;
 }
 
@@ -1189,15 +1695,24 @@ sub _rename_visible_nick {
   my ($self, $channel, %args) = @_;
   my $old_nick = $args{old_nick};
   my $new_nick = $args{new_nick};
-  return 0 unless defined $old_nick && !ref($old_nick) && length($old_nick);
-  return 0 unless defined $new_nick && !ref($new_nick) && length($new_nick);
+  my $old_key = $self->_nick_key($old_nick);
+  my $new_key = $self->_nick_key($new_nick);
+  return 0 unless defined $old_key;
+  return 0 unless defined $new_key;
 
-  my $state = $self->{channels}{$channel}
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return 0;
-  my $count = delete $state->{visible_nicks}{$old_nick}
+  my $entry = delete $state->{visible_nicks}{$old_key}
     or return 0;
-  $state->{visible_nicks}{$new_nick} ||= 0;
-  $state->{visible_nicks}{$new_nick} += $count;
+  my $count = $entry->{count} || 0;
+  $state->{visible_nicks}{$new_key} ||= {
+    count        => 0,
+    display_nick => $new_nick,
+  };
+  $state->{visible_nicks}{$new_key}{count} += $count;
+  $state->{visible_nicks}{$new_key}{display_nick} = $new_nick;
   return $count;
 }
 
@@ -1221,7 +1736,7 @@ sub _rename_client_channels {
   return 0 unless ref($client) eq 'HASH';
 
   my $count = 0;
-  for my $channel (sort keys %{$client->{joined_channels} || {}}) {
+  for my $channel (sort values %{$client->{joined_channels} || {}}) {
     $count += $self->_rename_visible_nick(
       $channel,
       old_nick => $args{old_nick},
@@ -1234,27 +1749,34 @@ sub _rename_client_channels {
 
 sub _visible_nicks_for_channel {
   my ($self, $channel) = @_;
-  my $state = $self->{channels}{$channel}
+  my $channel_key = $self->_channel_key($channel);
+  return () unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return ();
 
   return sort grep {
-    defined $_ && length $_ && ($state->{visible_nicks}{$_} || 0) > 0
+    defined $_ && length $_
+  } map {
+    $state->{visible_nicks}{$_}{display_nick}
+  } grep {
+    ($state->{visible_nicks}{$_}{count} || 0) > 0
   } keys %{$state->{visible_nicks} || {}};
 }
 
-sub _send_join_bootstrap {
+sub _send_names_list {
   my ($self, $client_id, $channel) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
-  my $state = $self->{channels}{$channel}
-    or return 0;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
 
-  if (defined $state->{topic_line} && length $state->{topic_line}) {
-    $self->_send_client_line($client_id, $state->{topic_line});
-  }
-
-  my @nicks = $self->_visible_nicks_for_channel($channel);
-  if (!grep { $_ eq $client->{nick} } @nicks) {
+  my @nicks = $self->_visible_nicks_for_channel($display_channel);
+  my $client_present = scalar grep {
+    defined $_
+      && defined $client->{nick}
+      && $_ eq $client->{nick}
+  } @nicks;
+  if (!$client_present && defined $self->_client_joined_channel_name($client, $display_channel)) {
     push @nicks, $client->{nick};
     @nicks = sort @nicks;
   }
@@ -1265,7 +1787,7 @@ sub _send_join_bootstrap {
       ':%s 353 %s = %s :%s',
       $self->{config}{server_name},
       $client->{nick},
-      $channel,
+      $display_channel,
       join(' ', @nicks),
     ),
   );
@@ -1275,11 +1797,25 @@ sub _send_join_bootstrap {
       ':%s 366 %s %s :End of /NAMES list.',
       $self->{config}{server_name},
       $client->{nick},
-      $channel,
+      $display_channel,
     ),
   );
 
   return 1;
+}
+
+sub _send_join_bootstrap {
+  my ($self, $client_id, $channel) = @_;
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
+    or return 0;
+
+  if (defined $state->{topic_line} && length $state->{topic_line}) {
+    $self->_send_client_line($client_id, $state->{topic_line});
+  }
+
+  return $self->_send_names_list($client_id, $state->{channel_name});
 }
 
 sub _channel_name_from_object_id {
@@ -1291,7 +1827,19 @@ sub _channel_name_from_object_id {
 
   my $channel = substr($object_id, length($prefix));
   return undef unless $self->_is_channel_name($channel);
-  return $channel;
+  return $self->_canonical_channel_name($channel);
+}
+
+sub _dm_nick_from_object_id {
+  my ($self, $object_id) = @_;
+  return undef unless defined $object_id && !ref($object_id);
+
+  my $prefix = 'irc:' . $self->{config}{network} . ':dm:';
+  return undef unless index($object_id, $prefix) == 0;
+
+  my $nick = substr($object_id, length($prefix));
+  return undef unless $self->_is_nick_name($nick);
+  return $nick;
 }
 
 sub _is_channel_name {
@@ -1303,9 +1851,20 @@ sub _is_channel_name {
       : 0;
 }
 
+sub _is_nick_name {
+  my ($self, $value) = @_;
+  return defined $value
+    && !ref($value)
+    && $value =~ /\A[^\x00\x07\r\n ,:#&][^\x00\x07\r\n ,:]*\z/
+      ? 1
+      : 0;
+}
+
 sub _broadcast_channel_line {
   my ($self, $channel, $line) = @_;
-  my $state = $self->{channels}{$channel}
+  my $channel_key = $self->_channel_key($channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
     or return 0;
 
   return $self->_send_line_to_client_ids(
@@ -1319,7 +1878,9 @@ sub _shared_client_ids_for_channels {
   my %client_ids;
 
   for my $channel (@{$channels || []}) {
-    my $state = $self->{channels}{$channel}
+    my $channel_key = $self->_channel_key($channel);
+    next unless defined $channel_key;
+    my $state = $self->{channels}{$channel_key}
       or next;
     for my $client_id (keys %{$state->{members} || {}}) {
       next if defined $args{exclude_client_id} && $client_id eq $args{exclude_client_id};
@@ -1336,17 +1897,19 @@ sub _shared_client_ids_for_client {
   my ($self, $client_id) = @_;
   my $client = $self->{clients}{$client_id}
     or return ();
-  my @channels = sort keys %{$client->{joined_channels} || {}};
+  my @channels = sort values %{$client->{joined_channels} || {}};
   return ($client_id) unless @channels;
   return $self->_shared_client_ids_for_channels(\@channels);
 }
 
 sub _shared_client_ids_for_nick {
   my ($self, $nick) = @_;
-  return () unless defined $nick && !ref($nick) && length($nick);
+  my $nick_key = $self->_nick_key($nick);
+  return () unless defined $nick_key;
 
   my @channels = grep {
-    ($self->{channels}{$_}{visible_nicks}{$nick} || 0) > 0
+    exists $self->{channels}{$_}{visible_nicks}{$nick_key}
+      && ($self->{channels}{$_}{visible_nicks}{$nick_key}{count} || 0) > 0
   } sort keys %{$self->{channels}};
   return $self->_shared_client_ids_for_channels(\@channels);
 }
