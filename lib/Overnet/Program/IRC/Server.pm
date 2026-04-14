@@ -566,6 +566,23 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'WHOIS') {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'WHOIS');
+      return 1;
+    }
+
+    my $target_nick = $params[0];
+    my $entry = $self->_whois_entry_for_nick($target_nick);
+    unless ($entry) {
+      $self->_send_no_such_nick($client_id, $target_nick);
+      return 1;
+    }
+
+    $self->_send_whois_reply($client_id, $entry);
+    return 1;
+  }
+
   if ($command eq 'MODE') {
     if (@params < 1 || !defined $params[0] || !length $params[0]) {
       $self->_send_need_more_params($client_id, 'MODE');
@@ -733,7 +750,7 @@ sub _handle_client_line {
   }
 
   if ($command eq 'TOPIC') {
-    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1]) {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
       $self->_send_need_more_params($client_id, 'TOPIC');
       return 1;
     }
@@ -748,6 +765,11 @@ sub _handle_client_line {
       return 1;
     }
 
+    if (@params == 1) {
+      $self->_send_topic_reply($client_id, $channel);
+      return 1;
+    }
+
     $self->_emit_client_input(
       $client,
       {
@@ -756,6 +778,11 @@ sub _handle_client_line {
         text    => $params[1],
       },
     );
+    return 1;
+  }
+
+  if ($command eq 'LUSERS') {
+    $self->_send_lusers_reply($client_id);
     return 1;
   }
 
@@ -770,14 +797,7 @@ sub _register_client_if_ready {
   return 0 unless defined $client->{username} && length($client->{username});
 
   $client->{registered} = 1;
-  $self->_send_client_line(
-    $client->{id},
-    sprintf(
-      ':%s 001 %s :Welcome to Overnet IRC',
-      $self->{config}{server_name},
-      $client->{nick},
-    ),
-  );
+  $self->_send_registration_prelude($client->{id});
   $self->_ensure_client_dm_subscription($client->{id});
   return 1;
 }
@@ -814,7 +834,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS);
 }
 
 sub _send_unknown_command {
@@ -831,6 +851,40 @@ sub _send_unknown_command {
       $command,
     ),
   );
+}
+
+sub _send_registration_prelude {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 001 %s :Welcome to Overnet IRC',
+      $self->{config}{server_name},
+      $client->{nick},
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 005 %s %s :are supported by this server',
+      $self->{config}{server_name},
+      $client->{nick},
+      $self->_isupport_tokens,
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 422 %s :MOTD File is missing',
+      $self->{config}{server_name},
+      $client->{nick},
+    ),
+  );
+
+  return 1;
 }
 
 sub _send_nonickname_given {
@@ -956,6 +1010,97 @@ sub _send_user_mode_is {
   );
 }
 
+sub _send_lusers_reply {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $target = $self->_client_numeric_target($client);
+  my $registered_users = scalar grep { $self->{clients}{$_}{registered} } keys %{$self->{clients}};
+  my $connected_clients = scalar keys %{$self->{clients}};
+  my $channels = scalar keys %{$self->{channels}};
+
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 251 %s :There are %d users and 0 services on 1 server',
+      $self->{config}{server_name},
+      $target,
+      $registered_users,
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 252 %s 0 :operator(s) online',
+      $self->{config}{server_name},
+      $target,
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 253 %s 0 :unknown connection(s)',
+      $self->{config}{server_name},
+      $target,
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 254 %s %d :channels formed',
+      $self->{config}{server_name},
+      $target,
+      $channels,
+    ),
+  );
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 255 %s :I have %d clients and 1 server',
+      $self->{config}{server_name},
+      $target,
+      $connected_clients,
+    ),
+  );
+}
+
+sub _send_topic_reply {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
+
+  my $channel_key = $self->_channel_key($display_channel);
+  return 0 unless defined $channel_key;
+  my $state = $self->{channels}{$channel_key}
+    || $self->_channel_state($display_channel);
+  my $target = $self->_client_numeric_target($client);
+
+  if (defined $state->{topic_text} && !ref($state->{topic_text}) && length($state->{topic_text})) {
+    return $self->_send_client_line(
+      $client_id,
+      sprintf(
+        ':%s 332 %s %s :%s',
+        $self->{config}{server_name},
+        $target,
+        $display_channel,
+        $state->{topic_text},
+      ),
+    );
+  }
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 331 %s %s :No topic is set',
+      $self->{config}{server_name},
+      $target,
+      $display_channel,
+    ),
+  );
+}
+
 sub _send_userhost_reply {
   my ($self, $client_id, $entries) = @_;
   my $client = $self->{clients}{$client_id}
@@ -1007,6 +1152,52 @@ sub _send_who_list {
   );
 }
 
+sub _send_whois_reply {
+  my ($self, $client_id, $entry) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  return 0 unless ref($entry) eq 'HASH';
+
+  my $target = $self->_client_numeric_target($client);
+  my $display_nick = $entry->{nick};
+  my $username = $entry->{username};
+  my $host = $entry->{host};
+  my $realname = $entry->{realname};
+
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 311 %s %s %s %s * :%s',
+      $self->{config}{server_name},
+      $target,
+      $display_nick,
+      $username,
+      $host,
+      $realname,
+    ),
+  );
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 312 %s %s %s :%s',
+      $self->{config}{server_name},
+      $target,
+      $display_nick,
+      $self->{config}{server_name},
+      $self->_server_description,
+    ),
+  );
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 318 %s %s :End of /WHOIS list.',
+      $self->{config}{server_name},
+      $target,
+      $display_nick,
+    ),
+  );
+}
+
 sub _client_numeric_target {
   my ($self, $client) = @_;
   return '*'
@@ -1035,6 +1226,19 @@ sub _nick_key {
 sub _default_presentational_host {
   my ($self) = @_;
   return 'overnet.invalid';
+}
+
+sub _isupport_tokens {
+  my ($self) = @_;
+  return join ' ',
+    'CASEMAPPING=rfc1459',
+    'CHANTYPES=#&',
+    'NETWORK=' . $self->{config}{network};
+}
+
+sub _server_description {
+  my ($self) = @_;
+  return 'Overnet IRC';
 }
 
 sub _presentational_host_for_client {
@@ -1165,6 +1369,31 @@ sub _userhost_entry_for_nick {
   my $host = $self->_presentational_host_for_client($client);
 
   return sprintf('%s=+%s@%s', $display_nick, $username, $host);
+}
+
+sub _whois_entry_for_nick {
+  my ($self, $nick) = @_;
+  my $nick_key = $self->_nick_key($nick);
+  return undef unless defined $nick_key;
+
+  my $client_id = $self->{nick_to_client_id}{$nick_key};
+  return undef unless defined $client_id && exists $self->{clients}{$client_id};
+  my $client = $self->{clients}{$client_id};
+
+  return {
+    nick     => $client->{nick},
+    username => (
+      defined $client->{username} && !ref($client->{username}) && length($client->{username})
+        ? $client->{username}
+        : $client->{nick}
+    ),
+    host     => $self->_presentational_host_for_client($client),
+    realname => (
+      defined $client->{realname} && !ref($client->{realname}) && length($client->{realname})
+        ? $client->{realname}
+        : $client->{nick}
+    ),
+  };
 }
 
 sub _who_entries_for_channel {
@@ -1454,6 +1683,7 @@ sub _render_subscription_item {
       return undef unless defined $body->{topic} && !ref($body->{topic});
       $line = sprintf(':%s TOPIC %s :%s', $nick, $channel, $body->{topic});
       $self->_channel_state($channel)->{topic_line} = $line;
+      $self->_channel_state($channel)->{topic_text} = $body->{topic};
     } elsif ($item_type eq 'event' && $event_type eq 'chat.join') {
       $self->_add_visible_nick($channel, $nick);
       $line = sprintf(':%s JOIN %s', $nick, $channel);
@@ -1821,6 +2051,7 @@ sub _channel_state {
     channel_name  => $channel,
     members       => {},
     visible_nicks => {},
+    topic_text    => undef,
   };
 }
 
