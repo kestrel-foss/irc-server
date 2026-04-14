@@ -523,6 +523,49 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'USERHOST') {
+    if (!@params) {
+      $self->_send_need_more_params($client_id, 'USERHOST');
+      return 1;
+    }
+
+    my @entries;
+    my %seen;
+    for my $nick (@params) {
+      my $nick_key = $self->_nick_key($nick);
+      next unless defined $nick_key;
+      next if $seen{$nick_key}++;
+
+      my $entry = $self->_userhost_entry_for_nick($nick);
+      push @entries, $entry if defined $entry;
+    }
+
+    $self->_send_userhost_reply($client_id, \@entries);
+    return 1;
+  }
+
+  if ($command eq 'WHO') {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'WHO');
+      return 1;
+    }
+
+    my $target = $params[0];
+    if (!$self->_is_channel_name($target)) {
+      $self->_send_no_such_channel($client_id, $target);
+      return 1;
+    }
+
+    my $channel = $self->_client_joined_channel_name($client, $target);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $target);
+      return 1;
+    }
+
+    $self->_send_who_list($client_id, $channel);
+    return 1;
+  }
+
   if ($command eq 'MODE') {
     if (@params < 1 || !defined $params[0] || !length $params[0]) {
       $self->_send_need_more_params($client_id, 'MODE');
@@ -771,7 +814,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO);
 }
 
 sub _send_unknown_command {
@@ -913,6 +956,57 @@ sub _send_user_mode_is {
   );
 }
 
+sub _send_userhost_reply {
+  my ($self, $client_id, $entries) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 302 %s :%s',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      join(' ', @{$entries || []}),
+    ),
+  );
+}
+
+sub _send_who_list {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
+
+  for my $entry ($self->_who_entries_for_channel($display_channel)) {
+    $self->_send_client_line(
+      $client_id,
+      sprintf(
+        ':%s 352 %s %s %s %s %s %s H :0 %s',
+        $self->{config}{server_name},
+        $self->_client_numeric_target($client),
+        $display_channel,
+        $entry->{username},
+        $entry->{host},
+        $self->{config}{server_name},
+        $entry->{nick},
+        $entry->{realname},
+      ),
+    );
+  }
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 315 %s %s :End of /WHO list.',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $display_channel,
+    ),
+  );
+}
+
 sub _client_numeric_target {
   my ($self, $client) = @_;
   return '*'
@@ -936,6 +1030,20 @@ sub _nick_key {
   my ($self, $nick) = @_;
   return undef unless defined $nick && !ref($nick) && length($nick);
   return $self->_irc_casefold($nick);
+}
+
+sub _default_presentational_host {
+  my ($self) = @_;
+  return 'overnet.invalid';
+}
+
+sub _presentational_host_for_client {
+  my ($self, $client) = @_;
+  return $self->_default_presentational_host
+    unless ref($client) eq 'HASH';
+  return $client->{peerhost}
+    if defined $client->{peerhost} && !ref($client->{peerhost}) && length($client->{peerhost});
+  return $self->_default_presentational_host;
 }
 
 sub _canonical_current_nick {
@@ -1039,6 +1147,63 @@ sub _emit_client_input {
   );
 
   return 1;
+}
+
+sub _userhost_entry_for_nick {
+  my ($self, $nick) = @_;
+  my $nick_key = $self->_nick_key($nick);
+  return undef unless defined $nick_key;
+
+  my $client_id = $self->{nick_to_client_id}{$nick_key};
+  return undef unless defined $client_id && exists $self->{clients}{$client_id};
+  my $client = $self->{clients}{$client_id};
+
+  my $display_nick = $client->{nick};
+  my $username = defined $client->{username} && !ref($client->{username}) && length($client->{username})
+    ? $client->{username}
+    : $display_nick;
+  my $host = $self->_presentational_host_for_client($client);
+
+  return sprintf('%s=+%s@%s', $display_nick, $username, $host);
+}
+
+sub _who_entries_for_channel {
+  my ($self, $channel) = @_;
+  my @entries;
+
+  for my $display_nick ($self->_visible_nicks_for_channel($channel)) {
+    my $nick_key = $self->_nick_key($display_nick);
+    next unless defined $nick_key;
+
+    my $client_id = $self->{nick_to_client_id}{$nick_key};
+    if (defined $client_id && exists $self->{clients}{$client_id}) {
+      my $client = $self->{clients}{$client_id};
+      push @entries, {
+        nick     => $client->{nick},
+        username => (
+          defined $client->{username} && !ref($client->{username}) && length($client->{username})
+            ? $client->{username}
+            : $client->{nick}
+        ),
+        host     => $self->_presentational_host_for_client($client),
+        realname => (
+          defined $client->{realname} && !ref($client->{realname}) && length($client->{realname})
+            ? $client->{realname}
+            : $client->{nick}
+        ),
+      };
+      next;
+    }
+
+    push @entries, {
+      nick     => $display_nick,
+      username => 'overnet',
+      host     => $self->_default_presentational_host,
+      realname => $display_nick,
+    };
+  }
+
+  return @entries;
 }
 
 sub _ensure_channel_subscription {
