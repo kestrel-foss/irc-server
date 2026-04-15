@@ -768,6 +768,37 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'INVITE') {
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
+      $self->_send_need_more_params($client_id, 'INVITE');
+      return 1;
+    }
+
+    my $target_nick = $params[0];
+    my $channel_input = $params[1];
+    if (!$self->_is_channel_name($channel_input)) {
+      $self->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $channel = $self->_client_joined_channel_name($client, $channel_input);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    if ($self->_is_authoritative_channel($channel)) {
+      return $self->_handle_authoritative_invite_command(
+        client_id   => $client_id,
+        channel     => $channel,
+        target_nick => $target_nick,
+      );
+    }
+
+    $self->_send_unknown_command($client_id, 'INVITE');
+    return 1;
+  }
+
   if ($command eq 'JOIN') {
     if (@params < 1 || !defined $params[0] || !length $params[0]) {
       $self->_send_need_more_params($client_id, 'JOIN');
@@ -781,16 +812,29 @@ sub _handle_client_line {
 
     my $channel = $self->_canonical_channel_name($channel_input);
     return 1 if defined $self->_client_joined_channel_name($client, $channel_input);
+    my $authoritative_join;
 
     if ($self->_is_authoritative_channel($channel)) {
-      my $join_denial = $self->_authoritative_join_denial_reason($channel, $client);
-      if (defined $join_denial) {
+      $authoritative_join = $self->_authoritative_join_admission_for_client($channel, $client);
+      unless ($authoritative_join->{allowed}) {
         $self->_send_cannot_join_channel(
           $client_id,
           $channel,
-          reason => $join_denial,
+          reason => $authoritative_join->{reason},
         );
         return 1;
+      }
+
+      if (defined $authoritative_join->{invite_code}) {
+        $self->_emit_client_input(
+          $client,
+          {
+            command      => 'JOIN',
+            target       => $channel,
+            actor_pubkey => $self->_client_authoritative_pubkey($client),
+            invite_code  => $authoritative_join->{invite_code},
+          },
+        );
       }
     }
 
@@ -801,16 +845,18 @@ sub _handle_client_line {
       sprintf(':%s JOIN %s', $client->{nick}, $channel),
     );
     $self->_send_join_bootstrap($client_id, $channel);
-    $self->_emit_client_input(
-      $client,
-      {
-        command => 'JOIN',
-        target  => $channel,
-      },
-      suppress_render_event_types => {
-        'chat.join' => 1,
-      },
-    );
+    if (!$self->_is_authoritative_channel($channel)) {
+      $self->_emit_client_input(
+        $client,
+        {
+          command => 'JOIN',
+          target  => $channel,
+        },
+        suppress_render_event_types => {
+          'chat.join' => 1,
+        },
+      );
+    }
     return 1;
   }
 
@@ -1046,7 +1092,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK INVITE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH);
 }
 
 sub _send_unknown_command {
@@ -1255,6 +1301,23 @@ sub _send_cannot_join_channel {
       $self->_client_numeric_target($client),
       $channel,
       $reason,
+    ),
+  );
+}
+
+sub _send_inviting {
+  my ($self, $client_id, $target_nick, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 341 %s %s %s',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $target_nick,
+      $channel,
     ),
   );
 }
@@ -1638,6 +1701,18 @@ sub _generate_authoritative_auth_challenge {
   );
 }
 
+sub _generate_authoritative_invite_code {
+  my ($self, %args) = @_;
+  return sha256_hex(join ':',
+    time(),
+    $$,
+    rand(),
+    ($args{channel} || ''),
+    ($args{actor_pubkey} || ''),
+    ($args{target_pubkey} || ''),
+  );
+}
+
 sub _is_authoritative_channel {
   my ($self, $channel) = @_;
   return 0 unless $self->_authority_profile eq 'nip29';
@@ -1812,19 +1887,73 @@ sub _authoritative_group_metadata_from_state {
   };
 }
 
-sub _authoritative_join_denial_reason {
+sub _authoritative_pending_invite_for_pubkey {
+  my ($self, $channel, $pubkey) = @_;
+  return undef unless defined $pubkey && !ref($pubkey) && length($pubkey);
+
+  my (undef, $group_id) = $self->_authoritative_group_binding($channel);
+  return undef unless defined $group_id;
+
+  my %pending;
+  for my $event (@{$self->_read_authoritative_nip29_events($channel)}) {
+    next unless ref($event) eq 'HASH';
+
+    my %tags = $self->_first_tag_values($event->{tags});
+    next unless defined $tags{h} && $tags{h} eq $group_id;
+
+    if (($event->{kind} || 0) == 9009) {
+      next unless defined $tags{code} && length($tags{code});
+      next if defined $tags{p} && $tags{p} ne $pubkey;
+
+      $pending{$tags{code}} = {
+        code => $tags{code},
+        (defined $tags{p} ? (target_pubkey => $tags{p}) : ()),
+      };
+      next;
+    }
+
+    if (($event->{kind} || 0) == 9021) {
+      next unless defined $tags{code} && length($tags{code});
+      next unless exists $pending{$tags{code}};
+      next unless defined $event->{pubkey} && $event->{pubkey} eq $pubkey;
+
+      delete $pending{$tags{code}};
+    }
+  }
+
+  return (values %pending)[0];
+}
+
+sub _authoritative_join_admission_for_client {
   my ($self, $channel, $client) = @_;
   my $state = $self->_derive_authoritative_channel_state($channel);
-  return '' unless ref($state) eq 'HASH';
+  return {
+    allowed => 0,
+    reason  => '',
+  } unless ref($state) eq 'HASH';
 
   my $pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_channel_mode_enabled($state, 'i') ? '+i' : ''
-    unless defined $pubkey;
+  return {
+    allowed => 0,
+    reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
+  } unless defined $pubkey;
 
   my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
-  return undef if ref($member) eq 'HASH';
+  return {
+    allowed => 1,
+    member  => 1,
+  } if ref($member) eq 'HASH';
 
-  return $self->_channel_mode_enabled($state, 'i') ? '+i' : '';
+  my $invite = $self->_authoritative_pending_invite_for_pubkey($channel, $pubkey);
+  return {
+    allowed     => 1,
+    invite_code => $invite->{code},
+  } if ref($invite) eq 'HASH' && defined $invite->{code};
+
+  return {
+    allowed => 0,
+    reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
+  };
 }
 
 sub _authoritative_name_entries_for_channel {
@@ -1993,6 +2122,60 @@ sub _handle_authoritative_kick_command {
   return 1;
 }
 
+sub _handle_authoritative_invite_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $target_nick_input = $args{target_nick};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  my $target_nick = $self->_canonical_current_nick($target_nick_input);
+  return $self->_send_no_such_nick($client_id, $target_nick_input)
+    unless defined $target_nick;
+  my $target_client = $self->_client_for_current_nick($target_nick);
+  return $self->_send_no_such_nick($client_id, $target_nick_input)
+    unless ref($target_client) eq 'HASH';
+  my $target_pubkey = $self->_client_authoritative_pubkey($target_client);
+  return $self->_send_no_such_nick($client_id, $target_nick_input)
+    unless defined $target_pubkey;
+
+  my $invite_code = $self->_generate_authoritative_invite_code(
+    channel       => $channel,
+    actor_pubkey  => $actor_pubkey,
+    target_pubkey => $target_pubkey,
+  );
+
+  $self->_emit_client_input(
+    $client,
+    {
+      command       => 'INVITE',
+      target        => $channel,
+      actor_pubkey  => $actor_pubkey,
+      target_nick   => $target_nick,
+      target_pubkey => $target_pubkey,
+      invite_code   => $invite_code,
+    },
+  );
+
+  $self->_send_inviting($client_id, $target_nick, $channel);
+  $self->_send_client_line(
+    $target_client->{id},
+    sprintf(':%s INVITE %s :%s', $client->{nick}, $target_nick, $channel),
+  );
+  return 1;
+}
+
 sub _nick_in_use {
   my ($self, $nick, %args) = @_;
   my $key = $self->_nick_key($nick);
@@ -2124,6 +2307,8 @@ sub _is_authoritative_nip29_event {
   return 0 unless $kind == 9000
     || $kind == 9001
     || $kind == 9002
+    || $kind == 9009
+    || $kind == 9021
     || $kind == 39000
     || $kind == 39001
     || $kind == 39002
