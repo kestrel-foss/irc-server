@@ -11,7 +11,7 @@ use lib "$FindBin::Bin/../../overnet-code/lib";
 use lib "$FindBin::Bin/../../overnet-code/local/lib/perl5";
 use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file);
 
-use Net::Nostr::Key;
+use Overnet::Core::Nostr;
 use Overnet::Program::Host;
 use Overnet::Program::Runtime;
 
@@ -122,6 +122,7 @@ my $host = Overnet::Program::Host->new(
     'subscriptions.read',
     'overnet.emit_event',
     'overnet.emit_state',
+    'overnet.emit_private_message',
     'overnet.emit_capabilities',
   ],
   services => {
@@ -132,6 +133,7 @@ my $host = Overnet::Program::Host->new(
     'subscriptions.close'        => {},
     'overnet.emit_event'         => {},
     'overnet.emit_state'         => {},
+    'overnet.emit_private_message' => {},
     'overnet.emit_capabilities'  => {},
   },
   startup_timeout_ms  => 2_000,
@@ -170,7 +172,12 @@ print "  /opt/perl-5.42/bin/perl $client_script --nick bob --port $ready_details
 print "\n";
 print "The client auto-joins #overnet. Plain text sends to the current target.\n";
 if (defined $tls_config) {
-  print "HexChat can connect without -insecure. Use its normal TLS path and accept the local self-signed certificate if prompted.\n";
+  my $hexchat_host = _hexchat_connect_host($ready_details->{listen_host});
+  my $hexchat_uri = sprintf('ircs://%s:%d/%%23overnet', $hexchat_host, $ready_details->{listen_port});
+  print "HexChat can connect without -insecure.\n";
+  print "For the local generated cert, run:\n";
+  print "  SSL_CERT_FILE=" . _shell_quote($tls_config->{cert_chain_file}) . " hexchat " . _shell_quote($hexchat_uri) . "\n";
+  print "If you supply your own CA-trusted cert/key, normal HexChat TLS works without SSL_CERT_FILE.\n";
 }
 print "Press Ctrl-C here to shut the server down.\n";
 
@@ -264,7 +271,7 @@ sub _ensure_signing_key {
   make_path($dir)
     unless -d $dir;
 
-  my $key = Net::Nostr::Key->new;
+  my $key = Overnet::Core::Nostr->generate_key;
   $key->save_privkey($path);
   chmod 0600, $path;
   return 1;
@@ -319,6 +326,20 @@ sub _default_state_dir {
   return File::Spec->catdir($ENV{HOME}, '.local', 'state', 'overnet-program-irc')
     if defined $ENV{HOME} && length $ENV{HOME};
   return File::Spec->catdir(File::Spec->tmpdir, 'overnet-program-irc');
+}
+
+sub _hexchat_connect_host {
+  my ($listen_host) = @_;
+  return '127.0.0.1'
+    if !defined $listen_host || !length $listen_host || $listen_host eq '0.0.0.0' || $listen_host eq '::';
+  return $listen_host;
+}
+
+sub _shell_quote {
+  my ($value) = @_;
+  $value = '' unless defined $value;
+  $value =~ s/'/'"'"'/g;
+  return "'$value'";
 }
 
 sub _usage {

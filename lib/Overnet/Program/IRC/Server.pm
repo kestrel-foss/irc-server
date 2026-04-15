@@ -2,15 +2,14 @@ package Overnet::Program::IRC::Server;
 
 use strict;
 use warnings;
+use Digest::SHA qw(sha256_hex);
 use IO::Handle;
 use IO::Select;
 use IO::Socket::INET;
 use IO::Socket::SSL ();
 use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
-use Net::Nostr::DirectMessage;
-use Net::Nostr::Event;
-use Net::Nostr::Key;
+use Overnet::Core::Nostr;
 use Time::HiRes qw(time);
 use Overnet::Program::Protocol;
 use Overnet::Program::TLSConfig;
@@ -230,7 +229,7 @@ sub _load_runtime_init {
   die "config.adapter_config must be an object\n"
     unless ref($adapter_config) eq 'HASH';
 
-  my $signing_key = Net::Nostr::Key->new(privkey => $signing_key_file);
+  my $signing_key = Overnet::Core::Nostr->load_key(privkey => $signing_key_file);
 
   $self->{instance_id} = $params->{instance_id};
   $self->{config} = {
@@ -373,6 +372,8 @@ sub _accept_client {
     realname        => undef,
     dm_key          => undef,
     e2ee_pubkey     => undef,
+    authority_pubkey => undef,
+    authority_challenge => undef,
     joined_channels => {},
     peerhost        => eval { $socket->peerhost } || '',
     peerport        => eval { $socket->peerport } || 0,
@@ -571,6 +572,71 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'OVERNETAUTH') {
+    if (@params < 1 || !defined $params[0] || !length $params[0]) {
+      $self->_send_need_more_params($client_id, 'OVERNETAUTH');
+      return 1;
+    }
+
+    my $subcommand = uc($params[0]);
+    if ($subcommand eq 'CHALLENGE') {
+      my $challenge = $self->_generate_authoritative_auth_challenge($client);
+      $client->{authority_challenge} = $challenge;
+      $self->_send_server_notice($client_id, "OVERNETAUTH CHALLENGE $challenge");
+      return 1;
+    }
+
+    if ($subcommand eq 'AUTH') {
+      if (@params < 2 || !defined $params[1] || !length $params[1]) {
+        $self->_send_need_more_params($client_id, 'OVERNETAUTH');
+        return 1;
+      }
+
+      my $challenge = $client->{authority_challenge};
+      unless (defined $challenge && !ref($challenge) && length($challenge)) {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a prior challenge');
+        return 1;
+      }
+
+      my $decoded = eval { decode_base64($params[1]) };
+      my $event_hash = eval { JSON::PP::decode_json($decoded) };
+      unless (ref($event_hash) eq 'HASH') {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a base64-encoded event object');
+        return 1;
+      }
+
+      my $event = Overnet::Core::Nostr->event_from_wire($event_hash);
+      unless ($event && eval { $event->validate; 1 }) {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a valid signed Nostr event');
+        return 1;
+      }
+      unless ($event->kind == 22242) {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires kind 22242');
+        return 1;
+      }
+
+      my %tags = $self->_first_tag_values($event->tags);
+      unless (defined $tags{challenge} && $tags{challenge} eq $challenge) {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH challenge does not match');
+        return 1;
+      }
+
+      my $scope = $self->_authoritative_auth_scope;
+      unless (defined $tags{relay} && $tags{relay} eq $scope) {
+        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH relay scope does not match');
+        return 1;
+      }
+
+      $client->{authority_pubkey} = $event->pubkey;
+      delete $client->{authority_challenge};
+      $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH ' . $client->{authority_pubkey});
+      return 1;
+    }
+
+    $self->_send_unknown_command($client_id, 'OVERNETAUTH');
+    return 1;
+  }
+
   if ($command eq 'USERHOST') {
     if (!@params) {
       $self->_send_need_more_params($client_id, 'USERHOST');
@@ -659,7 +725,46 @@ sub _handle_client_line {
       return 1;
     }
 
+    if ($self->_is_authoritative_channel($channel)) {
+      if (@params >= 2 && defined $params[1] && length $params[1]) {
+        return $self->_handle_authoritative_mode_command(
+          client_id => $client_id,
+          channel   => $channel,
+          params    => \@params,
+        );
+      }
+    }
+
     $self->_send_channel_mode_is($client_id, $channel);
+    return 1;
+  }
+
+  if ($command eq 'KICK') {
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
+      $self->_send_need_more_params($client_id, 'KICK');
+      return 1;
+    }
+    my $channel_input = $params[0];
+    if (!$self->_is_channel_name($channel_input)) {
+      $self->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $channel = $self->_client_joined_channel_name($client, $channel_input);
+    unless (defined $channel) {
+      $self->_send_not_on_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    if ($self->_is_authoritative_channel($channel)) {
+      return $self->_handle_authoritative_kick_command(
+        client_id => $client_id,
+        channel   => $channel,
+        params    => \@params,
+      );
+    }
+
+    $self->_send_unknown_command($client_id, 'KICK');
     return 1;
   }
 
@@ -764,6 +869,11 @@ sub _handle_client_line {
         return 1;
       }
 
+      if ($self->_channel_is_moderated_for_client($channel, $client)) {
+        $self->_send_cannot_send_to_channel($client_id, $channel);
+        return 1;
+      }
+
       $self->_emit_client_input(
         $client,
         {
@@ -835,6 +945,11 @@ sub _handle_client_line {
       return 1;
     }
 
+    if ($self->_channel_is_topic_restricted_for_client($channel, $client)) {
+      $self->_send_chan_op_privs_needed($client_id, $channel);
+      return 1;
+    }
+
     $self->_emit_client_input(
       $client,
       {
@@ -868,7 +983,7 @@ sub _register_client_if_ready {
   return 0 unless defined $client->{username} && length($client->{username});
 
   $client->{registered} = 1;
-  $client->{dm_key} ||= Net::Nostr::Key->new;
+  $client->{dm_key} ||= Overnet::Core::Nostr->generate_key;
   $self->_send_registration_prelude($client->{id});
   $self->_ensure_client_dm_subscription($client->{id});
   return 1;
@@ -919,7 +1034,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH);
 }
 
 sub _send_unknown_command {
@@ -1079,20 +1194,61 @@ sub _send_not_on_channel {
   );
 }
 
+sub _send_cannot_send_to_channel {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 404 %s %s :Cannot send to channel',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+    ),
+  );
+}
+
+sub _send_chan_op_privs_needed {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 482 %s %s :You\'re not channel operator',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+    ),
+  );
+}
+
 sub _send_channel_mode_is {
   my ($self, $client_id, $channel) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
   my $display_channel = $self->_canonical_channel_name($channel);
   return 0 unless defined $display_channel;
+  my $channel_modes = '+n';
+
+  if (my $authoritative = $self->_derive_authoritative_channel_state($display_channel)) {
+    $channel_modes = $authoritative->{channel_modes}
+      if defined $authoritative->{channel_modes}
+        && !ref($authoritative->{channel_modes})
+        && length($authoritative->{channel_modes});
+  }
 
   return $self->_send_client_line(
     $client_id,
     sprintf(
-      ':%s 324 %s %s +n',
+      ':%s 324 %s %s %s',
       $self->{config}{server_name},
       $self->_client_numeric_target($client),
       $display_channel,
+      $channel_modes,
     ),
   );
 }
@@ -1423,6 +1579,372 @@ sub _client_has_capability {
   return $client->{capabilities}{$capability} ? 1 : 0;
 }
 
+sub _authority_profile {
+  my ($self) = @_;
+  return $self->{config}{adapter_config}{authority_profile} || '';
+}
+
+sub _authoritative_auth_scope {
+  my ($self) = @_;
+  return sprintf(
+    'irc://%s/%s',
+    $self->{config}{server_name},
+    $self->{config}{network},
+  );
+}
+
+sub _generate_authoritative_auth_challenge {
+  my ($self, $client) = @_;
+  return sha256_hex(join ':',
+    time(),
+    $$,
+    rand(),
+    (ref($client) eq 'HASH' ? ($client->{id} || '') : ''),
+    (ref($client) eq 'HASH' ? ($client->{peerhost} || '') : ''),
+    (ref($client) eq 'HASH' ? ($client->{peerport} || 0) : 0),
+  );
+}
+
+sub _is_authoritative_channel {
+  my ($self, $channel) = @_;
+  return 0 unless $self->_authority_profile eq 'nip29';
+  return 0 unless $self->_is_channel_name($channel);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  my $channel_groups = $self->{config}{adapter_config}{channel_groups};
+  return 0 unless ref($channel_groups) eq 'HASH';
+  return exists $channel_groups->{$canonical} ? 1 : 0;
+}
+
+sub _authoritative_group_binding {
+  my ($self, $channel) = @_;
+  return unless $self->_is_authoritative_channel($channel);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return unless defined $canonical;
+
+  my $config = $self->{config}{adapter_config} || {};
+  my $group_host = $config->{group_host};
+  return unless defined $group_host && !ref($group_host) && length($group_host);
+
+  my $channel_groups = $config->{channel_groups};
+  return unless ref($channel_groups) eq 'HASH';
+  return unless exists $channel_groups->{$canonical};
+
+  my $binding = $channel_groups->{$canonical};
+  my $group_id = ref($binding) eq 'HASH'
+    ? $binding->{group_id}
+    : $binding;
+  return unless defined $group_id && !ref($group_id) && length($group_id);
+
+  return ($group_host, $group_id);
+}
+
+sub _authoritative_nip29_stream_name {
+  my ($self, $channel) = @_;
+  my ($group_host, $group_id) = $self->_authoritative_group_binding($channel);
+  return undef unless defined $group_host && defined $group_id;
+
+  return join ':',
+    'irc.authority.nip29',
+    $self->{config}{network},
+    $group_host,
+    $group_id;
+}
+
+sub _read_authoritative_nip29_events {
+  my ($self, $channel) = @_;
+  my $stream = $self->_authoritative_nip29_stream_name($channel);
+  return [] unless defined $stream;
+
+  my $result = eval {
+    $self->_request(
+      method => 'events.read',
+      params => {
+        stream => $stream,
+      },
+    );
+  };
+  return [] if $@;
+  return [] unless ref($result->{entries}) eq 'ARRAY';
+
+  return [
+    map { $_->{event} }
+    grep { ref($_) eq 'HASH' && ref($_->{event}) eq 'HASH' }
+    @{$result->{entries}}
+  ];
+}
+
+sub _derive_authoritative_channel_state {
+  my ($self, $channel) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $authoritative_events = $self->_read_authoritative_nip29_events($channel);
+  return undef unless @{$authoritative_events};
+
+  my $result = eval {
+    $self->_request(
+      method => 'adapters.derive',
+      params => {
+        adapter_session_id => $self->{adapter_session_id},
+        operation          => 'authoritative_channel_state',
+        input              => {
+          network              => $self->{config}{network},
+          target               => $self->_canonical_channel_name($channel),
+          authoritative_events => $authoritative_events,
+        },
+      },
+    );
+  };
+  return undef if $@;
+  return undef unless ref($result->{state}) eq 'ARRAY' && @{$result->{state}};
+  return $result->{state}[0];
+}
+
+sub _client_authoritative_pubkey {
+  my ($self, $client) = @_;
+  return undef unless ref($client) eq 'HASH';
+  return undef unless defined $client->{authority_pubkey} && !ref($client->{authority_pubkey}) && length($client->{authority_pubkey});
+  return $client->{authority_pubkey};
+}
+
+sub _authoritative_member_for_pubkey {
+  my ($self, $state, $pubkey) = @_;
+  return undef unless ref($state) eq 'HASH';
+  return undef unless defined $pubkey && !ref($pubkey) && length($pubkey);
+
+  for my $member (@{$state->{members} || []}) {
+    next unless ref($member) eq 'HASH';
+    next unless defined $member->{pubkey};
+    return $member if $member->{pubkey} eq $pubkey;
+  }
+
+  return undef;
+}
+
+sub _authoritative_roles_for_client {
+  my ($self, $channel, $client) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  return () unless defined $pubkey;
+
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return () unless ref($state) eq 'HASH';
+  my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
+  return () unless ref($member) eq 'HASH';
+  return @{$member->{roles} || []};
+}
+
+sub _client_is_authoritative_operator {
+  my ($self, $channel, $client) = @_;
+  return scalar grep { $_ eq 'irc.operator' } $self->_authoritative_roles_for_client($channel, $client);
+}
+
+sub _client_has_authoritative_voice {
+  my ($self, $channel, $client) = @_;
+  return scalar grep { $_ eq 'irc.voice' } $self->_authoritative_roles_for_client($channel, $client);
+}
+
+sub _channel_mode_enabled {
+  my ($self, $state, $mode_letter) = @_;
+  return 0 unless ref($state) eq 'HASH';
+  return 0 unless defined $mode_letter && !ref($mode_letter) && length($mode_letter) == 1;
+  my $channel_modes = $state->{channel_modes} || '';
+  return $channel_modes =~ /\Q$mode_letter\E/ ? 1 : 0;
+}
+
+sub _channel_is_moderated_for_client {
+  my ($self, $channel, $client) = @_;
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return 0 unless ref($state) eq 'HASH';
+  return 0 unless $self->_channel_mode_enabled($state, 'm');
+  return 0 if $self->_client_is_authoritative_operator($channel, $client);
+  return 0 if $self->_client_has_authoritative_voice($channel, $client);
+  return 1;
+}
+
+sub _channel_is_topic_restricted_for_client {
+  my ($self, $channel, $client) = @_;
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return 0 unless ref($state) eq 'HASH';
+  return 0 unless $self->_channel_mode_enabled($state, 't');
+  return 0 if $self->_client_is_authoritative_operator($channel, $client);
+  return 1;
+}
+
+sub _authoritative_group_metadata_from_state {
+  my ($self, $state) = @_;
+  return {
+    closed           => $self->_channel_mode_enabled($state, 'i') ? 1 : 0,
+    moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
+    topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
+  };
+}
+
+sub _authoritative_name_entries_for_channel {
+  my ($self, $client, $channel) = @_;
+  return () unless ref($client) eq 'HASH';
+
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return () unless ref($state) eq 'HASH';
+
+  my $channel_key = $self->_channel_key($channel);
+  return () unless defined $channel_key;
+  my $channel_state = $self->{channels}{$channel_key}
+    or return ();
+
+  my @entries;
+  my %seen;
+  for my $client_id (sort keys %{$channel_state->{members} || {}}) {
+    next unless exists $self->{clients}{$client_id};
+    my $member_client = $self->{clients}{$client_id};
+    next unless $member_client->{registered};
+    next unless defined $member_client->{nick} && !ref($member_client->{nick}) && length($member_client->{nick});
+
+    my $pubkey = $self->_client_authoritative_pubkey($member_client);
+    my $member = defined $pubkey
+      ? $self->_authoritative_member_for_pubkey($state, $pubkey)
+      : undef;
+    my $prefix = ref($member) eq 'HASH'
+      ? ($member->{presentational_prefix} || '')
+      : '';
+
+    push @entries, {
+      nick    => $member_client->{nick},
+      display => $prefix . $member_client->{nick},
+    };
+    $seen{$member_client->{nick}} = 1;
+  }
+
+  for my $nick ($self->_visible_nicks_for_channel($channel)) {
+    next if $seen{$nick}++;
+    push @entries, {
+      nick    => $nick,
+      display => $nick,
+    };
+  }
+
+  if (!@entries && defined $self->_client_joined_channel_name($client, $channel)) {
+    push @entries, {
+      nick    => $client->{nick},
+      display => $client->{nick},
+    };
+  }
+
+  return map { $_->{display} }
+    sort { $a->{nick} cmp $b->{nick} } @entries;
+}
+
+sub _handle_authoritative_mode_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my @params = @{$args{params} || []};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  my $mode = $params[1];
+  return $self->_send_need_more_params($client_id, 'MODE')
+    unless defined $mode && !ref($mode) && length($mode);
+
+  my %input = (
+    command      => 'MODE',
+    target       => $channel,
+    mode         => $mode,
+    actor_pubkey => $actor_pubkey,
+  );
+
+  my $mode_line = sprintf(':%s MODE %s %s', $client->{nick}, $channel, $mode);
+  if ($mode =~ /\A[+-][ov]\z/) {
+    return $self->_send_need_more_params($client_id, 'MODE')
+      unless defined $params[2] && !ref($params[2]) && length($params[2]);
+
+    my $target_nick = $self->_canonical_current_nick($params[2]);
+    return $self->_send_no_such_nick($client_id, $params[2])
+      unless defined $target_nick;
+    my $target_client = $self->_client_for_current_nick($target_nick);
+    return $self->_send_no_such_nick($client_id, $params[2])
+      unless ref($target_client) eq 'HASH';
+    my $target_pubkey = $self->_client_authoritative_pubkey($target_client);
+    return $self->_send_no_such_nick($client_id, $params[2])
+      unless defined $target_pubkey;
+
+    my $member = $self->_authoritative_member_for_pubkey($state, $target_pubkey) || {};
+    $input{target_pubkey} = $target_pubkey;
+    $input{current_roles} = [ @{$member->{roles} || []} ];
+    $mode_line .= ' ' . $target_nick;
+  } elsif ($mode =~ /\A[+-][imt]\z/) {
+    $input{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } else {
+    $self->_send_unknown_command($client_id, 'MODE');
+    return 1;
+  }
+
+  $self->_emit_client_input($client, \%input);
+  $self->_broadcast_channel_line($channel, $mode_line);
+  return 1;
+}
+
+sub _handle_authoritative_kick_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my @params = @{$args{params} || []};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  my $target_nick = $self->_canonical_current_nick($params[1]);
+  return $self->_send_no_such_nick($client_id, $params[1])
+    unless defined $target_nick;
+  my $target_client = $self->_client_for_current_nick($target_nick);
+  return $self->_send_no_such_nick($client_id, $params[1])
+    unless ref($target_client) eq 'HASH';
+  my $target_pubkey = $self->_client_authoritative_pubkey($target_client);
+  return $self->_send_no_such_nick($client_id, $params[1])
+    unless defined $target_pubkey;
+
+  my $reason = @params >= 3 ? $params[2] : undef;
+  $self->_emit_client_input(
+    $client,
+    {
+      command       => 'KICK',
+      target        => $channel,
+      actor_pubkey  => $actor_pubkey,
+      target_pubkey => $target_pubkey,
+      (defined $reason ? (text => $reason) : ()),
+    },
+  );
+
+  my $line = sprintf(':%s KICK %s %s', $client->{nick}, $channel, $target_nick);
+  $line .= ' :' . $reason
+    if defined $reason && length $reason;
+  $self->_broadcast_channel_line($channel, $line);
+  $self->_remove_client_from_channel(
+    $target_client->{id},
+    $channel,
+    nick => $target_client->{nick},
+  );
+  return 1;
+}
+
 sub _nick_in_use {
   my ($self, $nick, %args) = @_;
   my $key = $self->_nick_key($nick);
@@ -1508,11 +2030,89 @@ sub _emit_client_input {
     },
   );
   $self->{inputs_processed}++;
+
+  if ($self->_store_authoritative_mapped_result(
+      target => $payload{target},
+      mapped => $mapped,
+    )) {
+    return 1;
+  }
+
   $self->_emit_mapped_result(
     $mapped,
     originating_client_id => $client->{id},
     suppress_render_event_types => $opts{suppress_render_event_types},
   );
+
+  return 1;
+}
+
+sub _append_authoritative_nip29_event {
+  my ($self, $channel, $event) = @_;
+  return 0 unless ref($event) eq 'HASH';
+
+  my $stream = $self->_authoritative_nip29_stream_name($channel);
+  return 0 unless defined $stream;
+
+  $self->_request(
+    method => 'events.append',
+    params => {
+      stream => $stream,
+      event  => $event,
+    },
+  );
+  return 1;
+}
+
+sub _is_authoritative_nip29_event {
+  my ($self, %args) = @_;
+  my $channel = $args{channel};
+  my $event = $args{event};
+  return 0 unless $self->_is_authoritative_channel($channel);
+  return 0 unless ref($event) eq 'HASH';
+
+  my $kind = $event->{kind};
+  return 0 unless defined $kind && !ref($kind);
+  return 0 unless $kind == 9000
+    || $kind == 9001
+    || $kind == 9002
+    || $kind == 39000
+    || $kind == 39001
+    || $kind == 39002
+    || $kind == 39003;
+
+  my (undef, $group_id) = $self->_authoritative_group_binding($channel);
+  return 0 unless defined $group_id;
+
+  my %tags = $self->_first_tag_values($event->{tags});
+  return 0 unless defined $tags{h} && $tags{h} eq $group_id;
+  return 1;
+}
+
+sub _store_authoritative_mapped_result {
+  my ($self, %args) = @_;
+  my $channel = $args{target};
+  my $mapped = $args{mapped};
+  return 0 unless $self->_is_authoritative_channel($channel);
+  return 0 unless ref($mapped) eq 'HASH';
+
+  my @events;
+  push @events, $mapped->{event}
+    if ref($mapped->{event}) eq 'HASH';
+  push @events, grep { ref($_) eq 'HASH' } @{$mapped->{events}}
+    if ref($mapped->{events}) eq 'ARRAY';
+  return 0 unless @events;
+  return 0 if exists $mapped->{state} || exists $mapped->{capabilities};
+  return 0 unless @events == grep {
+    $self->_is_authoritative_nip29_event(
+      channel => $channel,
+      event   => $_,
+    )
+  } @events;
+
+  for my $event (@events) {
+    $self->_append_authoritative_nip29_event($channel, $event);
+  }
 
   return 1;
 }
@@ -1893,7 +2493,7 @@ sub _render_subscription_item {
     );
   }
 
-  my $event = eval { Net::Nostr::Event->from_wire($data) };
+  my $event = Overnet::Core::Nostr->event_from_wire($data);
   return undef unless $event;
 
   my %tags = $self->_first_tag_values($event->tags);
@@ -2161,7 +2761,7 @@ sub _emit_private_message_candidate {
     or die "Unknown originating_client_id for encrypted private message\n";
   die "Encrypted private-message sender must be registered\n"
     unless $sender->{registered};
-  $sender->{dm_key} ||= Net::Nostr::Key->new;
+  $sender->{dm_key} ||= Overnet::Core::Nostr->generate_key;
 
   my %tags = $self->_first_tag_values($candidate->{tags});
   my $private_type = $tags{overnet_et} || '';
@@ -2195,7 +2795,7 @@ sub _emit_private_message_candidate {
   my $recipient = $self->{clients}{$target_client_id};
   die "Encrypted private-message recipient must be registered\n"
     unless $recipient->{registered};
-  $recipient->{dm_key} ||= Net::Nostr::Key->new;
+  $recipient->{dm_key} ||= Overnet::Core::Nostr->generate_key;
 
   my $payload = {
     overnet_v    => $tags{overnet_v} || '0.1.0',
@@ -2206,15 +2806,11 @@ sub _emit_private_message_candidate {
     body         => $body,
   };
 
-  my $rumor = Net::Nostr::DirectMessage->create(
-    sender_pubkey => $sender->{dm_key}->pubkey_hex,
-    content       => JSON::PP::encode_json($payload),
-    recipients    => [$recipient->{dm_key}->pubkey_hex],
-  );
-  my ($wrap) = Net::Nostr::DirectMessage->wrap_for_recipients(
-    rumor       => $rumor,
-    sender_key  => $sender->{dm_key},
-    skip_sender => 1,
+  my $transport = Overnet::Core::Nostr->wrap_private_message(
+    sender_key        => $sender->{dm_key},
+    payload           => $payload,
+    recipient_pubkeys => [ $recipient->{dm_key}->pubkey_hex ],
+    skip_sender       => 1,
   );
 
   my $irc_command = $private_type eq 'chat.dm_notice' ? 'NOTICE' : 'PRIVMSG';
@@ -2228,8 +2824,8 @@ sub _emit_private_message_candidate {
           line     => sprintf(':%s %s %s :%s', $sender->{nick}, $irc_command, $recipient->{nick}, $body->{text}),
         },
         transport => {
-          %{$wrap->to_hash},
-          decrypted_rumor => $rumor->to_hash,
+          %{$transport->{transport}->to_hash},
+          decrypted_rumor => $transport->{decrypted_rumor}->to_hash,
         },
       },
     },
@@ -2271,7 +2867,7 @@ sub _emit_opaque_private_message_transport {
     return 0;
   }
 
-  my $wrap = eval { Net::Nostr::Event->from_wire($transport) };
+  my $wrap = Overnet::Core::Nostr->event_from_wire($transport);
   if (!$wrap || !eval { $wrap->validate; 1 }) {
     $self->_send_server_notice($client->{id}, 'Malformed overnet-e2ee transport');
     return 0;
@@ -2327,14 +2923,12 @@ sub _sign_candidate_event {
   die "candidate event content is required\n"
     unless defined $candidate->{content} && !ref($candidate->{content});
 
-  my $event = $self->{signing_key}->create_event(
+  return $self->{signing_key}->create_event_hash(
     kind       => $candidate->{kind},
     created_at => $candidate->{created_at},
     tags       => $candidate->{tags},
     content    => $candidate->{content},
   );
-
-  return $event->to_hash;
 }
 
 sub _request {
@@ -2670,15 +3264,22 @@ sub _send_names_list {
   my $display_channel = $self->_canonical_channel_name($channel);
   return 0 unless defined $display_channel;
 
-  my @nicks = $self->_visible_nicks_for_channel($display_channel);
-  my $client_present = scalar grep {
-    defined $_
-      && defined $client->{nick}
-      && $_ eq $client->{nick}
-  } @nicks;
-  if (!$client_present && defined $self->_client_joined_channel_name($client, $display_channel)) {
-    push @nicks, $client->{nick};
-    @nicks = sort @nicks;
+  my @nicks;
+  if ($self->_is_authoritative_channel($display_channel)) {
+    @nicks = $self->_authoritative_name_entries_for_channel($client, $display_channel);
+  }
+
+  if (!@nicks) {
+    @nicks = $self->_visible_nicks_for_channel($display_channel);
+    my $client_present = scalar grep {
+      defined $_
+        && defined $client->{nick}
+        && $_ eq $client->{nick}
+    } @nicks;
+    if (!$client_present && defined $self->_client_joined_channel_name($client, $display_channel)) {
+      push @nicks, $client->{nick};
+      @nicks = sort @nicks;
+    }
   }
 
   $self->_send_client_line(
