@@ -7,6 +7,7 @@ use IO::Select;
 use IO::Socket::INET;
 use IO::Socket::SSL ();
 use JSON::PP ();
+use Net::Nostr::DirectMessage;
 use Net::Nostr::Event;
 use Net::Nostr::Key;
 use Time::HiRes qw(time);
@@ -49,6 +50,7 @@ sub new {
     inputs_processed            => 0,
     events_emitted              => 0,
     state_emitted               => 0,
+    private_messages_emitted    => 0,
     capabilities_emitted        => 0,
   }, $class;
 }
@@ -366,6 +368,7 @@ sub _accept_client {
     nick            => undef,
     username        => undef,
     realname        => undef,
+    dm_key          => undef,
     joined_channels => {},
     peerhost        => eval { $socket->peerhost } || '',
     peerport        => eval { $socket->peerport } || 0,
@@ -803,6 +806,7 @@ sub _register_client_if_ready {
   return 0 unless defined $client->{username} && length($client->{username});
 
   $client->{registered} = 1;
+  $client->{dm_key} ||= Net::Nostr::Key->new;
   $self->_send_registration_prelude($client->{id});
   $self->_ensure_client_dm_subscription($client->{id});
   return 1;
@@ -1392,6 +1396,7 @@ sub _emit_client_input {
   $self->{inputs_processed}++;
   $self->_emit_mapped_result(
     $mapped,
+    originating_client_id => $client->{id},
     suppress_render_event_types => $opts{suppress_render_event_types},
   );
 
@@ -1723,7 +1728,9 @@ sub _disconnect_client {
 sub _handle_subscription_event {
   my ($self, $params) = @_;
   return 0 unless ref($params) eq 'HASH';
-  return 0 unless ($params->{item_type} || '') eq 'event' || ($params->{item_type} || '') eq 'state';
+  return 0 unless ($params->{item_type} || '') eq 'event'
+    || ($params->{item_type} || '') eq 'state'
+    || ($params->{item_type} || '') eq 'private_message';
   return 0 unless ref($params->{data}) eq 'HASH';
 
   my $data = $params->{data};
@@ -1749,6 +1756,20 @@ sub _render_subscription_item {
   my $item_type = $args{item_type};
   my $data = $args{data};
   return undef unless ref($data) eq 'HASH';
+
+  if ($item_type eq 'private_message') {
+    my $rumor = $data->{decrypted_rumor};
+    return undef unless ref($rumor) eq 'HASH';
+    my $content = $rumor->{content};
+    return undef unless ref($content) eq 'HASH';
+
+    return $self->_render_private_message_item(
+      event_type => $data->{private_type},
+      object_id  => $data->{object_id},
+      provenance => $content->{provenance},
+      body       => $content->{body},
+    );
+  }
 
   my $event = eval { Net::Nostr::Event->from_wire($data) };
   return undef unless $event;
@@ -1810,38 +1831,12 @@ sub _render_subscription_item {
   }
 
   if (($tags{overnet_ot} || '') eq 'chat.dm' && $item_type eq 'event') {
-    my $target_nick = $self->_dm_nick_from_object_id($tags{overnet_oid});
-    return undef unless defined $target_nick;
-
-    my $nick = $provenance->{external_identity};
-    return undef unless defined $nick && !ref($nick) && length($nick);
-
-    my $display_target_nick = $self->_canonical_current_nick($target_nick) || $target_nick;
-    my $line;
-    if ($event_type eq 'chat.dm_message') {
-      return undef unless defined $body->{text} && !ref($body->{text});
-      $line = sprintf(':%s PRIVMSG %s :%s', $nick, $display_target_nick, $body->{text});
-    } elsif ($event_type eq 'chat.dm_notice') {
-      return undef unless defined $body->{text} && !ref($body->{text});
-      $line = sprintf(':%s NOTICE %s :%s', $nick, $display_target_nick, $body->{text});
-    } else {
-      return undef;
-    }
-
-    my $target_key = $self->_nick_key($target_nick);
-    return undef unless defined $target_key;
-    my @client_ids = grep {
-      exists $self->{clients}{$_}
-        && $self->{clients}{$_}{registered}
-        && defined $self->_nick_key($self->{clients}{$_}{nick})
-        && $self->_nick_key($self->{clients}{$_}{nick}) eq $target_key
-    } sort keys %{$self->{clients}};
-    return undef unless @client_ids;
-
-    return {
-      line       => $line,
-      client_ids => \@client_ids,
-    };
+    return $self->_render_private_message_item(
+      event_type => $event_type,
+      object_id  => $tags{overnet_oid},
+      provenance => $provenance,
+      body       => $body,
+    );
   }
 
   if (($tags{overnet_ot} || '') eq 'irc.network' && $item_type eq 'event' && $event_type eq 'irc.nick') {
@@ -1866,11 +1861,64 @@ sub _render_subscription_item {
   return undef;
 }
 
+sub _render_private_message_item {
+  my ($self, %args) = @_;
+  my $event_type = $args{event_type} || '';
+  my $target_nick = $self->_dm_nick_from_object_id($args{object_id});
+  return undef unless defined $target_nick;
+
+  my $provenance = $args{provenance};
+  return undef unless ref($provenance) eq 'HASH';
+  my $nick = $provenance->{external_identity};
+  return undef unless defined $nick && !ref($nick) && length($nick);
+
+  my $body = $args{body};
+  return undef unless ref($body) eq 'HASH';
+  return undef unless defined $body->{text} && !ref($body->{text});
+
+  my $display_target_nick = $self->_canonical_current_nick($target_nick) || $target_nick;
+  my $line;
+  if ($event_type eq 'chat.dm_message') {
+    $line = sprintf(':%s PRIVMSG %s :%s', $nick, $display_target_nick, $body->{text});
+  } elsif ($event_type eq 'chat.dm_notice') {
+    $line = sprintf(':%s NOTICE %s :%s', $nick, $display_target_nick, $body->{text});
+  } else {
+    return undef;
+  }
+
+  my $target_key = $self->_nick_key($target_nick);
+  return undef unless defined $target_key;
+  my @client_ids = grep {
+    exists $self->{clients}{$_}
+      && $self->{clients}{$_}{registered}
+      && defined $self->_nick_key($self->{clients}{$_}{nick})
+      && $self->_nick_key($self->{clients}{$_}{nick}) eq $target_key
+  } sort keys %{$self->{clients}};
+  return undef unless @client_ids;
+
+  return {
+    line       => $line,
+    client_ids => \@client_ids,
+  };
+}
+
 sub _emit_mapped_result {
   my ($self, $result, %opts) = @_;
   my $suppress = $opts{suppress_render_event_types} || {};
+  my $originating_client_id = $opts{originating_client_id};
 
   for my $event (@{$result->{events} || []}) {
+    my %candidate_tags = $self->_first_tag_values($event->{tags});
+    if (($candidate_tags{overnet_ot} || '') eq 'chat.dm'
+        && (($candidate_tags{overnet_et} || '') eq 'chat.dm_message'
+          || ($candidate_tags{overnet_et} || '') eq 'chat.dm_notice')) {
+      $self->_emit_private_message_candidate(
+        $event,
+        originating_client_id => $originating_client_id,
+      );
+      next;
+    }
+
     my $signed = $self->_sign_candidate_event($event);
     my %tags = $self->_first_tag_values($signed->{tags});
     if ($suppress->{$tags{overnet_et} || ''}) {
@@ -1901,6 +1949,98 @@ sub _emit_mapped_result {
   }
 
   return 1;
+}
+
+sub _emit_private_message_candidate {
+  my ($self, $candidate, %opts) = @_;
+
+  die "private-message candidate event must be an object\n"
+    unless ref($candidate) eq 'HASH';
+
+  my $originating_client_id = $opts{originating_client_id};
+  die "originating_client_id is required for encrypted private messages\n"
+    unless defined $originating_client_id && !ref($originating_client_id) && length($originating_client_id);
+
+  my $sender = $self->{clients}{$originating_client_id}
+    or die "Unknown originating_client_id for encrypted private message\n";
+  die "Encrypted private-message sender must be registered\n"
+    unless $sender->{registered};
+  $sender->{dm_key} ||= Net::Nostr::Key->new;
+
+  my %tags = $self->_first_tag_values($candidate->{tags});
+  my $private_type = $tags{overnet_et} || '';
+  my $object_type = $tags{overnet_ot} || '';
+  my $object_id = $tags{overnet_oid} || '';
+  die "Encrypted private-message candidate must target chat.dm\n"
+    unless $object_type eq 'chat.dm';
+  die "Encrypted private-message candidate must be chat.dm_message or chat.dm_notice\n"
+    unless $private_type eq 'chat.dm_message' || $private_type eq 'chat.dm_notice';
+
+  my $content = eval { JSON::PP::decode_json($candidate->{content}) };
+  die "Encrypted private-message candidate content must decode to an object\n"
+    unless ref($content) eq 'HASH';
+
+  my $body = $content->{body};
+  die "Encrypted private-message candidate body must be an object\n"
+    unless ref($body) eq 'HASH';
+  die "Encrypted private-message candidate body.text must be a string\n"
+    unless defined $body->{text} && !ref($body->{text});
+
+  my $target_nick = $self->_dm_nick_from_object_id($object_id);
+  die "Encrypted private-message candidate object_id must target an IRC nick\n"
+    unless defined $target_nick;
+  my $target_key = $self->_nick_key($target_nick);
+  die "Encrypted private-message target nick is invalid\n"
+    unless defined $target_key;
+  my $target_client_id = $self->{nick_to_client_id}{$target_key};
+  die "Encrypted private-message target nick is not connected\n"
+    unless defined $target_client_id && exists $self->{clients}{$target_client_id};
+
+  my $recipient = $self->{clients}{$target_client_id};
+  die "Encrypted private-message recipient must be registered\n"
+    unless $recipient->{registered};
+  $recipient->{dm_key} ||= Net::Nostr::Key->new;
+
+  my $payload = {
+    overnet_v    => $tags{overnet_v} || '0.1.0',
+    private_type => $private_type,
+    object_type  => $object_type,
+    object_id    => $object_id,
+    provenance   => $content->{provenance},
+    body         => $body,
+  };
+
+  my $rumor = Net::Nostr::DirectMessage->create(
+    sender_pubkey => $sender->{dm_key}->pubkey_hex,
+    content       => JSON::PP::encode_json($payload),
+    recipients    => [$recipient->{dm_key}->pubkey_hex],
+  );
+  my ($wrap) = Net::Nostr::DirectMessage->wrap_for_recipients(
+    rumor       => $rumor,
+    sender_key  => $sender->{dm_key},
+    skip_sender => 1,
+  );
+
+  my $irc_command = $private_type eq 'chat.dm_notice' ? 'NOTICE' : 'PRIVMSG';
+  my $result = $self->_request(
+    method => 'overnet.emit_private_message',
+    params => {
+      message => {
+        source => {
+          protocol => 'irc',
+          network  => $self->{config}{network},
+          line     => sprintf(':%s %s %s :%s', $sender->{nick}, $irc_command, $recipient->{nick}, $body->{text}),
+        },
+        transport => {
+          %{$wrap->to_hash},
+          decrypted_rumor => $rumor->to_hash,
+        },
+      },
+    },
+  );
+  $self->{private_messages_emitted}++;
+
+  return $result;
 }
 
 sub _sign_candidate_event {
