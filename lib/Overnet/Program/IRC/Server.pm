@@ -7,6 +7,7 @@ use IO::Select;
 use IO::Socket::INET;
 use IO::Socket::SSL ();
 use JSON::PP ();
+use MIME::Base64 qw(decode_base64 encode_base64);
 use Net::Nostr::DirectMessage;
 use Net::Nostr::Event;
 use Net::Nostr::Key;
@@ -15,6 +16,7 @@ use Overnet::Program::Protocol;
 use Overnet::Program::TLSConfig;
 
 our $VERSION = '0.001';
+my $E2EE_DM_BODY_PREFIX = '+overnet-e2ee-v1 ';
 
 sub new {
   my ($class, %args) = @_;
@@ -365,10 +367,12 @@ sub _accept_client {
     socket          => $socket,
     read_buffer     => '',
     registered      => 0,
+    capabilities    => {},
     nick            => undef,
     username        => undef,
     realname        => undef,
     dm_key          => undef,
+    e2ee_pubkey     => undef,
     joined_channels => {},
     peerhost        => eval { $socket->peerhost } || '',
     peerport        => eval { $socket->peerport } || 0,
@@ -523,6 +527,47 @@ sub _handle_client_line {
     }
 
     $self->_send_unknown_command($client_id, $command);
+    return 1;
+  }
+
+  if ($command eq 'OVERNETKEY') {
+    if (!$self->_client_has_capability($client, 'overnet-e2ee')) {
+      $self->_send_server_notice($client_id, 'OVERNETKEY requires CAP overnet-e2ee');
+      return 1;
+    }
+
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
+      $self->_send_need_more_params($client_id, 'OVERNETKEY');
+      return 1;
+    }
+
+    my $subcommand = uc($params[0]);
+    if ($subcommand eq 'SET') {
+      my $pubkey = lc $params[1];
+      if ($pubkey !~ /\A[0-9a-f]{64}\z/) {
+        $self->_send_server_notice($client_id, 'OVERNETKEY SET requires a 64-character lowercase hex pubkey');
+        return 1;
+      }
+
+      $client->{e2ee_pubkey} = $pubkey;
+      $self->_send_server_notice($client_id, "OVERNETKEY SET $pubkey");
+      return 1;
+    }
+
+    if ($subcommand eq 'GET') {
+      my $target_nick = $self->_canonical_current_nick($params[1]);
+      if (!defined $target_nick) {
+        $self->_send_no_such_nick($client_id, $params[1]);
+        return 1;
+      }
+
+      my $target_client = $self->_client_for_current_nick($target_nick);
+      my $pubkey = ref($target_client) eq 'HASH' ? ($target_client->{e2ee_pubkey} || '*') : '*';
+      $self->_send_server_notice($client_id, "OVERNETKEY GET $target_nick $pubkey");
+      return 1;
+    }
+
+    $self->_send_unknown_command($client_id, 'OVERNETKEY');
     return 1;
   }
 
@@ -741,6 +786,23 @@ sub _handle_client_line {
       return 1;
     }
 
+    my ($e2ee_transport, $e2ee_error, $is_e2ee) = $self->_decode_e2ee_dm_body($params[1]);
+    if ($is_e2ee) {
+      if (!defined $e2ee_transport) {
+        $self->_send_server_notice($client_id, $e2ee_error);
+        return 1;
+      }
+
+      $self->_emit_opaque_private_message_transport(
+        client       => $client,
+        command      => $command,
+        target_nick  => $target_nick,
+        body_text    => $params[1],
+        transport    => $e2ee_transport,
+      );
+      return 1;
+    }
+
     $self->_emit_client_input(
       $client,
       {
@@ -816,11 +878,14 @@ sub _handle_cap_command {
   my ($self, $client_id, $params) = @_;
   my @params = @{$params || []};
   my $subcommand = defined $params[0] ? uc($params[0]) : '';
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my @supported = $self->_supported_capabilities;
 
   if ($subcommand eq 'LS') {
     return $self->_send_client_line(
       $client_id,
-      sprintf(':%s CAP * LS :', $self->{config}{server_name}),
+      sprintf(':%s CAP * LS :%s', $self->{config}{server_name}, join(' ', @supported)),
     );
   }
 
@@ -828,6 +893,16 @@ sub _handle_cap_command {
     if (@params < 2 || !defined $params[1] || !length $params[1]) {
       $self->_send_need_more_params($client_id, 'CAP');
       return 1;
+    }
+
+    my @requested = grep { defined($_) && length($_) } split /\s+/, $params[1];
+    my %supported = map { $_ => 1 } @supported;
+    if (@requested && !grep { !$supported{$_} } @requested) {
+      $client->{capabilities}{$_} = 1 for @requested;
+      return $self->_send_client_line(
+        $client_id,
+        sprintf(':%s CAP * ACK :%s', $self->{config}{server_name}, join(' ', @requested)),
+      );
     }
 
     return $self->_send_client_line(
@@ -844,7 +919,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS LIST);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY);
 }
 
 sub _send_unknown_command {
@@ -935,6 +1010,23 @@ sub _send_need_more_params {
       $self->{config}{server_name},
       $self->_client_numeric_target($client),
       $command,
+    ),
+  );
+}
+
+sub _send_server_notice {
+  my ($self, $client_id, $text) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  return 0 unless defined $client->{nick} && length($client->{nick});
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s NOTICE %s :%s',
+      $self->{config}{server_name},
+      $client->{nick},
+      $text,
     ),
   );
 }
@@ -1285,6 +1377,11 @@ sub _isupport_tokens {
     'NETWORK=' . $self->{config}{network};
 }
 
+sub _supported_capabilities {
+  my ($self) = @_;
+  return ('overnet-e2ee');
+}
+
 sub _server_description {
   my ($self) = @_;
   return 'Overnet IRC';
@@ -1307,6 +1404,23 @@ sub _canonical_current_nick {
   my $client_id = $self->{nick_to_client_id}{$key};
   return undef unless defined $client_id && exists $self->{clients}{$client_id};
   return $self->{clients}{$client_id}{nick};
+}
+
+sub _client_for_current_nick {
+  my ($self, $nick) = @_;
+  my $key = $self->_nick_key($nick);
+  return undef unless defined $key;
+
+  my $client_id = $self->{nick_to_client_id}{$key};
+  return undef unless defined $client_id && exists $self->{clients}{$client_id};
+  return $self->{clients}{$client_id};
+}
+
+sub _client_has_capability {
+  my ($self, $client, $capability) = @_;
+  return 0 unless ref($client) eq 'HASH';
+  return 0 unless defined $capability && !ref($capability) && length($capability);
+  return $client->{capabilities}{$capability} ? 1 : 0;
 }
 
 sub _nick_in_use {
@@ -1759,15 +1873,23 @@ sub _render_subscription_item {
 
   if ($item_type eq 'private_message') {
     my $rumor = $data->{decrypted_rumor};
-    return undef unless ref($rumor) eq 'HASH';
-    my $content = $rumor->{content};
-    return undef unless ref($content) eq 'HASH';
+    if (ref($rumor) eq 'HASH') {
+      my $content = $rumor->{content};
+      return undef unless ref($content) eq 'HASH';
 
-    return $self->_render_private_message_item(
-      event_type => $data->{private_type},
-      object_id  => $data->{object_id},
-      provenance => $content->{provenance},
-      body       => $content->{body},
+      return $self->_render_private_message_item(
+        event_type => $data->{private_type},
+        object_id  => $data->{object_id},
+        provenance => $content->{provenance},
+        body       => $content->{body},
+      );
+    }
+
+    return $self->_render_opaque_private_message_item(
+      event_type      => $data->{private_type},
+      object_id       => $data->{object_id},
+      sender_identity => $data->{sender_identity},
+      transport       => $data->{transport},
     );
   }
 
@@ -1900,6 +2022,80 @@ sub _render_private_message_item {
     line       => $line,
     client_ids => \@client_ids,
   };
+}
+
+sub _render_opaque_private_message_item {
+  my ($self, %args) = @_;
+  my $event_type = $args{event_type} || '';
+  my $target_nick = $self->_dm_nick_from_object_id($args{object_id});
+  return undef unless defined $target_nick;
+
+  my $sender_identity = $args{sender_identity};
+  return undef unless defined $sender_identity && !ref($sender_identity) && length($sender_identity);
+
+  my $transport = $args{transport};
+  return undef unless ref($transport) eq 'HASH';
+
+  my $display_target_nick = $self->_canonical_current_nick($target_nick) || $target_nick;
+  my $body = $self->_encode_e2ee_dm_body($transport);
+  my $line;
+  if ($event_type eq 'chat.dm_message') {
+    $line = sprintf(':%s PRIVMSG %s :%s', $sender_identity, $display_target_nick, $body);
+  } elsif ($event_type eq 'chat.dm_notice') {
+    $line = sprintf(':%s NOTICE %s :%s', $sender_identity, $display_target_nick, $body);
+  } else {
+    return undef;
+  }
+
+  my $target_key = $self->_nick_key($target_nick);
+  return undef unless defined $target_key;
+  my @client_ids = grep {
+    my $client = $self->{clients}{$_};
+    exists $self->{clients}{$_}
+      && $client->{registered}
+      && defined $self->_nick_key($client->{nick})
+      && $self->_nick_key($client->{nick}) eq $target_key
+      && $self->_client_has_capability($client, 'overnet-e2ee')
+      && defined $client->{e2ee_pubkey}
+  } sort keys %{$self->{clients}};
+  return undef unless @client_ids;
+
+  return {
+    line       => $line,
+    client_ids => \@client_ids,
+  };
+}
+
+sub _decode_e2ee_dm_body {
+  my ($self, $body) = @_;
+  return (undef, undef, 0)
+    unless defined $body && !ref($body);
+  return (undef, undef, 0)
+    unless index($body, $E2EE_DM_BODY_PREFIX) == 0;
+
+  my $encoded = substr($body, length($E2EE_DM_BODY_PREFIX));
+  return (undef, 'Malformed overnet-e2ee body: missing transport payload', 1)
+    unless defined $encoded && length($encoded);
+
+  my $decoded = eval { decode_base64($encoded) };
+  if ($@ || !defined $decoded || !length($decoded)) {
+    return (undef, 'Malformed overnet-e2ee body: base64 decode failed', 1);
+  }
+
+  my $transport = eval { JSON::PP::decode_json($decoded) };
+  if ($@ || ref($transport) ne 'HASH') {
+    return (undef, 'Malformed overnet-e2ee body: transport JSON is invalid', 1);
+  }
+
+  return ($transport, undef, 1);
+}
+
+sub _encode_e2ee_dm_body {
+  my ($self, $transport) = @_;
+  die "transport must be an object\n"
+    unless ref($transport) eq 'HASH';
+
+  return $E2EE_DM_BODY_PREFIX . encode_base64(JSON::PP::encode_json($transport), '');
 }
 
 sub _emit_mapped_result {
@@ -2035,6 +2231,80 @@ sub _emit_private_message_candidate {
           %{$wrap->to_hash},
           decrypted_rumor => $rumor->to_hash,
         },
+      },
+    },
+  );
+  $self->{private_messages_emitted}++;
+
+  return $result;
+}
+
+sub _emit_opaque_private_message_transport {
+  my ($self, %args) = @_;
+  my $client = $args{client};
+  my $command = $args{command} || '';
+  my $target_nick = $args{target_nick};
+  my $body_text = $args{body_text};
+  my $transport = $args{transport};
+
+  die "client is required for opaque private-message transport\n"
+    unless ref($client) eq 'HASH';
+  die "command must be PRIVMSG or NOTICE for opaque private-message transport\n"
+    unless $command eq 'PRIVMSG' || $command eq 'NOTICE';
+  die "target_nick is required for opaque private-message transport\n"
+    unless defined $target_nick && !ref($target_nick) && length($target_nick);
+  die "transport must be an object\n"
+    unless ref($transport) eq 'HASH';
+  die "body_text is required for opaque private-message transport\n"
+    unless defined $body_text && !ref($body_text) && length($body_text);
+
+  unless ($self->_client_has_capability($client, 'overnet-e2ee') && defined $client->{e2ee_pubkey}) {
+    $self->_send_server_notice($client->{id}, 'E2EE direct messages require CAP overnet-e2ee and OVERNETKEY SET');
+    return 0;
+  }
+
+  my $recipient = $self->_client_for_current_nick($target_nick);
+  unless (ref($recipient) eq 'HASH'
+      && $self->_client_has_capability($recipient, 'overnet-e2ee')
+      && defined $recipient->{e2ee_pubkey}) {
+    $self->_send_server_notice($client->{id}, 'Target nick is not E2EE-capable');
+    return 0;
+  }
+
+  my $wrap = eval { Net::Nostr::Event->from_wire($transport) };
+  if (!$wrap || !eval { $wrap->validate; 1 }) {
+    $self->_send_server_notice($client->{id}, 'Malformed overnet-e2ee transport');
+    return 0;
+  }
+
+  if ($wrap->kind != 1059) {
+    $self->_send_server_notice($client->{id}, 'Opaque private-message transport must use kind 1059');
+    return 0;
+  }
+
+  my @recipient_tags = grep {
+    ref($_) eq 'ARRAY' && @{$_} >= 2 && $_->[0] eq 'p'
+  } @{$wrap->tags || []};
+  if (@recipient_tags != 1 || ($recipient_tags[0][1] || '') ne $recipient->{e2ee_pubkey}) {
+    $self->_send_server_notice($client->{id}, 'Opaque private-message transport recipient does not match the target nick');
+    return 0;
+  }
+
+  my $private_type = $command eq 'NOTICE' ? 'chat.dm_notice' : 'chat.dm_message';
+  my $result = $self->_request(
+    method => 'overnet.emit_private_message',
+    params => {
+      message => {
+        source => {
+          protocol => 'irc',
+          network  => $self->{config}{network},
+          line     => sprintf(':%s %s %s :%s', $client->{nick}, $command, $recipient->{nick}, $body_text),
+        },
+        private_type    => $private_type,
+        object_type     => 'chat.dm',
+        object_id       => $self->_dm_object_id($recipient->{nick}),
+        sender_identity => $client->{nick},
+        transport       => $wrap->to_hash,
       },
     },
   );
