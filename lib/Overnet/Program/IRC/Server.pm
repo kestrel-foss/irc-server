@@ -786,6 +786,12 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'LIST') {
+    my $target = @params ? $params[0] : undef;
+    $self->_send_list_reply($client_id, $target);
+    return 1;
+  }
+
   $self->_send_unknown_command($client_id, $command);
   return 1;
 }
@@ -834,7 +840,7 @@ sub _handle_cap_command {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE USERHOST WHO WHOIS LUSERS LIST);
 }
 
 sub _send_unknown_command {
@@ -1060,6 +1066,45 @@ sub _send_lusers_reply {
       $self->{config}{server_name},
       $target,
       $connected_clients,
+    ),
+  );
+}
+
+sub _send_list_reply {
+  my ($self, $client_id, $target) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $nick = $self->_client_numeric_target($client);
+
+  $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 321 %s Channel :Users Name',
+      $self->{config}{server_name},
+      $nick,
+    ),
+  );
+
+  for my $entry ($self->_list_entries($target)) {
+    $self->_send_client_line(
+      $client_id,
+      sprintf(
+        ':%s 322 %s %s %d :%s',
+        $self->{config}{server_name},
+        $nick,
+        $entry->{channel},
+        $entry->{visible_users},
+        $entry->{topic},
+      ),
+    );
+  }
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 323 %s :End of /LIST',
+      $self->{config}{server_name},
+      $nick,
     ),
   );
 }
@@ -1429,6 +1474,55 @@ sub _who_entries_for_channel {
       username => 'overnet',
       host     => $self->_default_presentational_host,
       realname => $display_nick,
+    };
+  }
+
+  return @entries;
+}
+
+sub _list_entries {
+  my ($self, $target) = @_;
+  my @channels = map {
+    $self->{channels}{$_}{channel_name}
+  } grep {
+    ref($self->{channels}{$_}) eq 'HASH'
+      && defined $self->{channels}{$_}{channel_name}
+      && !ref($self->{channels}{$_}{channel_name})
+      && length($self->{channels}{$_}{channel_name})
+  } keys %{$self->{channels} || {}};
+
+  if (defined $target && length($target) && $self->_is_channel_name($target)) {
+    my $target_key = $self->_channel_key($target);
+    @channels = grep {
+      defined $self->_channel_key($_) && $self->_channel_key($_) eq $target_key
+    } @channels;
+  }
+
+  my @entries;
+  for my $channel (sort @channels) {
+    my $channel_key = $self->_channel_key($channel);
+    next unless defined $channel_key;
+    my $state = $self->{channels}{$channel_key};
+    next unless ref($state) eq 'HASH';
+
+    my %presented_nicks = map { $_ => 1 } $self->_visible_nicks_for_channel($state->{channel_name});
+    for my $client_id (keys %{$state->{members} || {}}) {
+      next unless exists $self->{clients}{$client_id};
+      my $client = $self->{clients}{$client_id};
+      next unless ref($client) eq 'HASH';
+      next unless $client->{registered};
+      next unless defined $client->{nick} && !ref($client->{nick}) && length($client->{nick});
+      $presented_nicks{$client->{nick}} = 1;
+    }
+
+    push @entries, {
+      channel       => $state->{channel_name},
+      visible_users => scalar(keys %presented_nicks),
+      topic         => (
+        defined $state->{topic_text} && !ref($state->{topic_text})
+          ? $state->{topic_text}
+          : ''
+      ),
     };
   }
 
@@ -2332,8 +2426,17 @@ sub _send_client_line {
   my $offset = 0;
   while ($offset < length $payload) {
     my $written = syswrite($client->{socket}, $payload, length($payload) - $offset, $offset);
-    die "failed to write IRC line: $!\n"
-      unless defined $written;
+    if (!defined $written) {
+      if ($!{EPIPE} || $!{ECONNRESET} || $!{ENOTCONN}) {
+        $self->_disconnect_client($client_id);
+        return 0;
+      }
+      die "failed to write IRC line: $!\n";
+    }
+    if ($written == 0) {
+      $self->_disconnect_client($client_id);
+      return 0;
+    }
     $offset += $written;
   }
 
