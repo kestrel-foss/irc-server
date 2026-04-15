@@ -782,6 +782,18 @@ sub _handle_client_line {
     my $channel = $self->_canonical_channel_name($channel_input);
     return 1 if defined $self->_client_joined_channel_name($client, $channel_input);
 
+    if ($self->_is_authoritative_channel($channel)) {
+      my $join_denial = $self->_authoritative_join_denial_reason($channel, $client);
+      if (defined $join_denial) {
+        $self->_send_cannot_join_channel(
+          $client_id,
+          $channel,
+          reason => $join_denial,
+        );
+        return 1;
+      }
+    }
+
     $self->_add_client_to_channel($client_id, $channel);
     $self->_ensure_channel_subscription($channel);
     $self->_broadcast_channel_line(
@@ -1222,6 +1234,27 @@ sub _send_chan_op_privs_needed {
       $self->{config}{server_name},
       $self->_client_numeric_target($client),
       $channel,
+    ),
+  );
+}
+
+sub _send_cannot_join_channel {
+  my ($self, $client_id, $channel, %args) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $reason = 'Cannot join channel';
+  $reason .= ' (' . $args{reason} . ')'
+    if defined $args{reason} && !ref($args{reason}) && length($args{reason});
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 473 %s %s :%s',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+      $reason,
     ),
   );
 }
@@ -1777,6 +1810,21 @@ sub _authoritative_group_metadata_from_state {
     moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
     topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
   };
+}
+
+sub _authoritative_join_denial_reason {
+  my ($self, $channel, $client) = @_;
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return '' unless ref($state) eq 'HASH';
+
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_channel_mode_enabled($state, 'i') ? '+i' : ''
+    unless defined $pubkey;
+
+  my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
+  return undef if ref($member) eq 'HASH';
+
+  return $self->_channel_mode_enabled($state, 'i') ? '+i' : '';
 }
 
 sub _authoritative_name_entries_for_channel {
