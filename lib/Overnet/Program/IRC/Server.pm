@@ -424,6 +424,7 @@ sub _accept_client {
     socket          => $socket,
     read_buffer     => '',
     registered      => 0,
+    cap_negotiation_active => 0,
     capabilities    => {},
     nick            => undef,
     username        => undef,
@@ -432,6 +433,9 @@ sub _accept_client {
     e2ee_pubkey     => undef,
     authority_pubkey => undef,
     authority_challenge => undef,
+    sasl_mechanism  => undef,
+    sasl_buffer     => '',
+    sasl_challenge_payload => undef,
     joined_channels => {},
     peerhost        => eval { $socket->peerhost } || '',
     peerport        => eval { $socket->peerport } || 0,
@@ -461,7 +465,26 @@ sub _pump_client_socket {
     return 1;
   }
 
-  $client->{read_buffer} .= $chunk;
+  my $probe_buffer = $client->{read_buffer} . $chunk;
+  if (!defined $self->{tls_server_args} && $self->_looks_like_tls_client_hello($probe_buffer)) {
+    $self->_log(
+      level   => 'warn',
+      message => 'TLS client hello received on plain IRC listener',
+      context => {
+        client_id => $client_id,
+        peerhost  => $client->{peerhost},
+        peerport  => $client->{peerport},
+      },
+    );
+    $self->_disconnect_client(
+      $client_id,
+      emit_quit => 0,
+      reason    => 'tls client hello on plain listener',
+    );
+    return 1;
+  }
+
+  $client->{read_buffer} = $probe_buffer;
   while ($client->{read_buffer} =~ s/\A([^\n]*\n)//) {
     my $line = $1;
     $line =~ s/\r?\n\z//;
@@ -471,6 +494,18 @@ sub _pump_client_socket {
     last if $self->{shutdown_complete};
   }
 
+  return 1;
+}
+
+sub _looks_like_tls_client_hello {
+  my ($self, $buffer) = @_;
+  return 0 unless defined $buffer;
+  return 0 unless length($buffer) >= 3;
+
+  my ($content_type, $major, $minor) = unpack('C3', substr($buffer, 0, 3));
+  return 0 unless $content_type == 0x16;
+  return 0 unless $major == 0x03;
+  return 0 unless $minor >= 0x00 && $minor <= 0x04;
   return 1;
 }
 
@@ -569,6 +604,10 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'AUTHENTICATE') {
+    return $self->_handle_authenticate_command($client_id, \@params);
+  }
+
   if ($command eq 'QUIT') {
     my $reason = @params >= 1 ? $params[0] : undef;
     $self->_disconnect_client(
@@ -650,12 +689,6 @@ sub _handle_client_line {
         return 1;
       }
 
-      my $challenge = $client->{authority_challenge};
-      unless (defined $challenge && !ref($challenge) && length($challenge)) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a prior challenge');
-        return 1;
-      }
-
       my $decoded = eval { decode_base64($params[1]) };
       my $event_hash = eval { JSON::PP::decode_json($decoded) };
       unless (ref($event_hash) eq 'HASH') {
@@ -663,9 +696,8 @@ sub _handle_client_line {
         return 1;
       }
 
-      my $validation = Overnet::Authority::Delegation->verify_auth_event(
-        challenge => $challenge,
-        scope     => $self->_authoritative_auth_scope,
+      my $validation = $self->_validate_authoritative_auth_event(
+        challenge => $client->{authority_challenge},
         event     => $event_hash,
       );
       unless ($validation->{valid}) {
@@ -681,14 +713,7 @@ sub _handle_client_line {
         return 1;
       }
 
-      $client->{authority_pubkey} = $validation->{pubkey};
-      delete $client->{authority_delegate_key};
-      delete $client->{authority_delegate_session_id};
-      delete $client->{authority_delegate_expires_at};
-      delete $client->{authority_delegate_event_id};
-      delete $client->{authority_delegate_sequence};
-      delete $self->{authoritative_last_created_at}{$client_id};
-      delete $self->{authoritative_delegate_sequences}{$client_id};
+      $self->_apply_authoritative_auth_validation($client, $validation);
       delete $client->{authority_challenge};
       $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH ' . $client->{authority_pubkey});
       return 1;
@@ -705,21 +730,15 @@ sub _handle_client_line {
       }
 
       if (@params == 1) {
-        if (!ref($client->{authority_delegate_key}) || ref($client->{authority_delegate_key}) ne 'Overnet::Core::Nostr::Key') {
-          $client->{authority_delegate_key} = Overnet::Core::Nostr->generate_key;
-        }
-        if (!defined $client->{authority_delegate_session_id} || ref($client->{authority_delegate_session_id}) || !length($client->{authority_delegate_session_id})) {
-          $client->{authority_delegate_session_id} = $self->_generate_authoritative_delegate_session_id($client);
-        }
-        $client->{authority_delegate_expires_at} = int(time()) + 3600;
+        my $delegate = $self->_ensure_authoritative_delegate_offer($client);
         $self->_send_server_notice(
           $client_id,
           join ' ',
             'OVERNETAUTH DELEGATE',
-            $client->{authority_delegate_key}->pubkey_hex,
-            $client->{authority_delegate_session_id},
-            $self->_authority_relay_url,
-            $client->{authority_delegate_expires_at},
+            $delegate->{delegate_pubkey},
+            $delegate->{session_id},
+            $delegate->{relay_url},
+            $delegate->{expires_at},
         );
         return 1;
       }
@@ -743,15 +762,14 @@ sub _handle_client_line {
         return 1;
       }
 
-      my $validation = Overnet::Authority::Delegation->verify_delegation_grant(
-        authority_pubkey => $client->{authority_pubkey},
-        relay_url        => $self->_authority_relay_url,
-        scope            => $self->_authoritative_auth_scope,
-        delegate_pubkey  => $delegate_key->pubkey_hex,
-        session_id       => $delegate_session_id,
-        expires_at       => $delegate_expires_at,
-        kind             => $self->_authority_grant_kind,
-        event            => $event_hash,
+      my $validation = $self->_accept_authoritative_delegate_event(
+        client          => $client,
+        event_hash      => $event_hash,
+        relay_url       => $self->_authority_relay_url,
+        session_id      => $delegate_session_id,
+        expires_at      => $delegate_expires_at,
+        delegate_pubkey => $delegate_key->pubkey_hex,
+        kind            => $self->_authority_grant_kind,
       );
       unless ($validation->{valid}) {
         my $reason = $validation->{reason} || '';
@@ -769,30 +787,12 @@ sub _handle_client_line {
           ? 'OVERNETAUTH DELEGATE session does not match'
           : $reason =~ /expiration does not match/i
           ? 'OVERNETAUTH DELEGATE expiration does not match'
+          : $reason =~ /relay publish failed/i
+          ? 'OVERNETAUTH DELEGATE relay publish failed'
           : 'OVERNETAUTH DELEGATE requires a valid signed Nostr event';
         $self->_send_server_notice($client_id, $message);
         return 1;
       }
-
-      my $publish = eval {
-        $self->_request(
-          method => 'nostr.publish_event',
-          params => {
-            relay_url => $self->_authority_relay_url,
-            event     => $validation->{event},
-          },
-        );
-      };
-      if ($@ || ref($publish) ne 'HASH' || !$publish->{accepted}) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE relay publish failed');
-        return 1;
-      }
-
-      $client->{authority_delegate_event_id} = $validation->{event_id};
-      $client->{authority_delegate_sequence} = 0;
-      $self->{authoritative_last_created_at}{$client_id} = 0;
-      $self->{authoritative_delegate_sequences}{$client_id} = 0;
-      $self->_read_authoritative_grant_events(force => 1);
       $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE');
       return 1;
     }
@@ -1242,6 +1242,8 @@ sub _register_client_if_ready {
   return 0 if $client->{registered};
   return 0 unless defined $client->{nick} && length($client->{nick});
   return 0 unless defined $client->{username} && length($client->{username});
+  return 0 if $client->{cap_negotiation_active};
+  return 0 if defined $client->{sasl_mechanism} && length($client->{sasl_mechanism});
 
   $client->{registered} = 1;
   $client->{dm_key} ||= Overnet::Core::Nostr->generate_key;
@@ -1259,6 +1261,7 @@ sub _handle_cap_command {
   my @supported = $self->_supported_capabilities;
 
   if ($subcommand eq 'LS') {
+    $client->{cap_negotiation_active} = 1 if !$client->{registered};
     return $self->_send_client_line(
       $client_id,
       sprintf(':%s CAP * LS :%s', $self->{config}{server_name}, join(' ', @supported)),
@@ -1270,6 +1273,7 @@ sub _handle_cap_command {
       $self->_send_need_more_params($client_id, 'CAP');
       return 1;
     }
+    $client->{cap_negotiation_active} = 1 if !$client->{registered};
 
     my @requested = grep { defined($_) && length($_) } split /\s+/, $params[1];
     my %supported = map { $_ => 1 } @supported;
@@ -1287,10 +1291,329 @@ sub _handle_cap_command {
     );
   }
 
-  return 1 if $subcommand eq 'END';
+  if ($subcommand eq 'END') {
+    $client->{cap_negotiation_active} = 0;
+    $self->_register_client_if_ready($client);
+    return 1;
+  }
 
   $self->_send_unknown_command($client_id, 'CAP');
   return 1;
+}
+
+sub _handle_authenticate_command {
+  my ($self, $client_id, $params) = @_;
+  my @params = @{$params || []};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  if (!@params || !defined($params[0]) || !length($params[0])) {
+    $self->_send_need_more_params($client_id, 'AUTHENTICATE');
+    return 1;
+  }
+
+  my $argument = $params[0];
+  if (!defined($client->{sasl_mechanism}) || !length($client->{sasl_mechanism})) {
+    unless ($self->_client_has_capability($client, 'sasl')) {
+      $self->_send_sasl_fail($client_id);
+      return 1;
+    }
+
+    my $mechanism = uc $argument;
+    unless ($mechanism eq 'NOSTR' && $self->_authority_profile eq 'nip29') {
+      $self->_send_sasl_fail($client_id);
+      return 1;
+    }
+
+    my $challenge_payload = $self->_start_sasl_nostr_exchange($client);
+    unless (ref($challenge_payload) eq 'HASH') {
+      $self->_send_sasl_fail($client_id);
+      return 1;
+    }
+
+    my $payload = encode_base64(JSON::PP::encode_json($challenge_payload), '');
+    $self->_send_authenticate_payload($client_id, $payload);
+    return 1;
+  }
+
+  if ($argument eq '*') {
+    $self->_reset_sasl_state($client);
+    $self->_send_sasl_fail($client_id);
+    return 1;
+  }
+
+  if ($argument eq '+') {
+    return $self->_complete_sasl_exchange($client_id);
+  }
+
+  $client->{sasl_buffer} .= $argument;
+  return 1 if length($argument) == 400;
+  return $self->_complete_sasl_exchange($client_id);
+}
+
+sub _start_sasl_nostr_exchange {
+  my ($self, $client) = @_;
+  return undef unless ref($client) eq 'HASH';
+
+  my $challenge = $self->_generate_authoritative_auth_challenge($client);
+  my %payload = (
+    challenge => $challenge,
+    scope     => $self->_authoritative_auth_scope,
+  );
+
+  if ($self->_authority_relay_enabled) {
+    my $delegate = $self->_ensure_authoritative_delegate_offer($client);
+    return undef unless ref($delegate) eq 'HASH';
+    @payload{qw(relay_url grant_kind delegate_pubkey session_id expires_at)} = (
+      $delegate->{relay_url},
+      $delegate->{grant_kind},
+      $delegate->{delegate_pubkey},
+      $delegate->{session_id},
+      $delegate->{expires_at},
+    );
+  }
+
+  $client->{authority_challenge} = $challenge;
+  $client->{sasl_mechanism} = 'NOSTR';
+  $client->{sasl_buffer} = '';
+  $client->{sasl_challenge_payload} = \%payload;
+  return \%payload;
+}
+
+sub _complete_sasl_exchange {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $decoded = eval { decode_base64($client->{sasl_buffer} || '') };
+  my $payload = eval { JSON::PP::decode_json($decoded) };
+  unless (ref($payload) eq 'HASH') {
+    $self->_reset_sasl_state($client);
+    $self->_send_sasl_fail($client_id);
+    return 1;
+  }
+
+  my $challenge_payload = ref($client->{sasl_challenge_payload}) eq 'HASH'
+    ? $client->{sasl_challenge_payload}
+    : {};
+  my $delegate_offer = $self->_authority_relay_enabled
+    ? {
+        key        => $client->{authority_delegate_key},
+        session_id => $challenge_payload->{session_id},
+        expires_at => $challenge_payload->{expires_at},
+      }
+    : undef;
+  my $auth_validation = $self->_validate_authoritative_auth_event(
+    challenge => $challenge_payload->{challenge},
+    event     => $payload->{auth_event},
+  );
+  unless ($auth_validation->{valid}) {
+    $self->_reset_sasl_state($client);
+    $self->_send_sasl_fail($client_id);
+    return 1;
+  }
+
+  $self->_apply_authoritative_auth_validation($client, $auth_validation);
+  if ($self->_authority_relay_enabled) {
+    if (ref($delegate_offer) eq 'HASH') {
+      $client->{authority_delegate_key} = $delegate_offer->{key}
+        if ref($delegate_offer->{key}) eq 'Overnet::Core::Nostr::Key';
+      $client->{authority_delegate_session_id} = $delegate_offer->{session_id}
+        if defined $delegate_offer->{session_id};
+      $client->{authority_delegate_expires_at} = $delegate_offer->{expires_at}
+        if defined $delegate_offer->{expires_at};
+    }
+    unless (ref($payload->{delegate_event}) eq 'HASH') {
+      $self->_clear_authoritative_binding($client);
+      $self->_reset_sasl_state($client);
+      $self->_send_sasl_fail($client_id);
+      return 1;
+    }
+    my $delegate_result = $self->_accept_authoritative_delegate_event(
+      client     => $client,
+      event_hash => $payload->{delegate_event},
+      relay_url  => $challenge_payload->{relay_url},
+      session_id => $challenge_payload->{session_id},
+      expires_at => $challenge_payload->{expires_at},
+      delegate_pubkey => $challenge_payload->{delegate_pubkey},
+      kind       => $challenge_payload->{grant_kind},
+    );
+    unless ($delegate_result->{valid}) {
+      $self->_clear_authoritative_binding($client);
+      $self->_reset_sasl_state($client);
+      $self->_send_sasl_fail($client_id);
+      return 1;
+    }
+  }
+
+  $self->_reset_sasl_state($client);
+  $self->_send_sasl_success($client_id);
+  $self->_register_client_if_ready($client);
+  return 1;
+}
+
+sub _reset_sasl_state {
+  my ($self, $client) = @_;
+  return 0 unless ref($client) eq 'HASH';
+  delete $client->{sasl_mechanism};
+  $client->{sasl_buffer} = '';
+  delete $client->{sasl_challenge_payload};
+  delete $client->{authority_challenge};
+  return 1;
+}
+
+sub _send_authenticate_payload {
+  my ($self, $client_id, $payload) = @_;
+  my $remaining = defined($payload) ? $payload : '';
+  my $sent = 0;
+
+  while (length($remaining) > 400) {
+    $self->_send_client_line($client_id, 'AUTHENTICATE ' . substr($remaining, 0, 400, ''));
+    $sent = 1;
+  }
+
+  if (length $remaining) {
+    return $self->_send_client_line($client_id, 'AUTHENTICATE ' . $remaining);
+  }
+
+  return $self->_send_client_line($client_id, $sent ? 'AUTHENTICATE +' : 'AUTHENTICATE +');
+}
+
+sub _send_sasl_success {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 903 %s :SASL authentication successful',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+    ),
+  );
+}
+
+sub _send_sasl_fail {
+  my ($self, $client_id) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 904 %s :SASL authentication failed',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+    ),
+  );
+}
+
+sub _validate_authoritative_auth_event {
+  my ($self, %args) = @_;
+  my $challenge = $args{challenge};
+  return {
+    valid  => 0,
+    reason => 'auth event challenge does not match',
+  } unless defined $challenge && !ref($challenge) && length($challenge);
+
+  return Overnet::Authority::Delegation->verify_auth_event(
+    challenge => $challenge,
+    scope     => $self->_authoritative_auth_scope,
+    event     => $args{event},
+  );
+}
+
+sub _apply_authoritative_auth_validation {
+  my ($self, $client, $validation) = @_;
+  return 0 unless ref($client) eq 'HASH';
+  return 0 unless ref($validation) eq 'HASH' && $validation->{valid};
+
+  $self->_clear_authoritative_binding($client);
+  $client->{authority_pubkey} = $validation->{pubkey};
+  return 1;
+}
+
+sub _clear_authoritative_binding {
+  my ($self, $client) = @_;
+  return 0 unless ref($client) eq 'HASH';
+  delete $client->{authority_pubkey};
+  delete $client->{authority_delegate_key};
+  delete $client->{authority_delegate_session_id};
+  delete $client->{authority_delegate_expires_at};
+  delete $client->{authority_delegate_event_id};
+  delete $client->{authority_delegate_sequence};
+  delete $self->{authoritative_last_created_at}{$client->{id}};
+  delete $self->{authoritative_delegate_sequences}{$client->{id}};
+  return 1;
+}
+
+sub _ensure_authoritative_delegate_offer {
+  my ($self, $client) = @_;
+  return undef unless ref($client) eq 'HASH';
+
+  if (!ref($client->{authority_delegate_key}) || ref($client->{authority_delegate_key}) ne 'Overnet::Core::Nostr::Key') {
+    $client->{authority_delegate_key} = Overnet::Core::Nostr->generate_key;
+  }
+  if (!defined $client->{authority_delegate_session_id}
+      || ref($client->{authority_delegate_session_id})
+      || !length($client->{authority_delegate_session_id})) {
+    $client->{authority_delegate_session_id} = $self->_generate_authoritative_delegate_session_id($client);
+  }
+  $client->{authority_delegate_expires_at} = int(time()) + 3600;
+
+  return {
+    relay_url       => $self->_authority_relay_url,
+    grant_kind      => $self->_authority_grant_kind,
+    delegate_pubkey => $client->{authority_delegate_key}->pubkey_hex,
+    session_id      => $client->{authority_delegate_session_id},
+    expires_at      => $client->{authority_delegate_expires_at},
+  };
+}
+
+sub _accept_authoritative_delegate_event {
+  my ($self, %args) = @_;
+  my $client = $args{client};
+  return {
+    valid  => 0,
+    reason => 'delegation event pubkey does not match the authenticated user',
+  } unless ref($client) eq 'HASH'
+    && defined $client->{authority_pubkey}
+    && !ref($client->{authority_pubkey})
+    && $client->{authority_pubkey} =~ /\A[0-9a-f]{64}\z/;
+
+  my $validation = Overnet::Authority::Delegation->verify_delegation_grant(
+    authority_pubkey => $client->{authority_pubkey},
+    relay_url        => $args{relay_url},
+    scope            => $self->_authoritative_auth_scope,
+    delegate_pubkey  => $args{delegate_pubkey},
+    session_id       => $args{session_id},
+    expires_at       => $args{expires_at},
+    kind             => $args{kind},
+    event            => $args{event_hash},
+  );
+  return $validation unless $validation->{valid};
+
+  my $publish = eval {
+    $self->_request(
+      method => 'nostr.publish_event',
+      params => {
+        relay_url => $args{relay_url},
+        event     => $validation->{event},
+      },
+    );
+  };
+  if ($@ || ref($publish) ne 'HASH' || !$publish->{accepted}) {
+    return {
+      valid  => 0,
+      reason => 'delegation relay publish failed',
+    };
+  }
+
+  $client->{authority_delegate_event_id} = $validation->{event_id};
+  $client->{authority_delegate_sequence} = 0;
+  $self->{authoritative_last_created_at}{$client->{id}} = 0;
+  $self->{authoritative_delegate_sequences}{$client->{id}} = 0;
+  $self->_read_authoritative_grant_events(force => 1);
+  return $validation;
 }
 
 sub _command_requires_registration {
@@ -1864,7 +2187,10 @@ sub _isupport_tokens {
 
 sub _supported_capabilities {
   my ($self) = @_;
-  return ('overnet-e2ee');
+  my @capabilities = ('overnet-e2ee');
+  push @capabilities, 'sasl'
+    if $self->_authority_profile eq 'nip29';
+  return @capabilities;
 }
 
 sub _server_description {
@@ -2553,7 +2879,7 @@ sub _authoritative_roles_for_client {
   my $pubkey = $self->_client_authoritative_pubkey($client);
   return () unless defined $pubkey;
 
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return () unless ref($state) eq 'HASH';
   my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
   return () unless ref($member) eq 'HASH';
@@ -2578,9 +2904,16 @@ sub _channel_mode_enabled {
   return $channel_modes =~ /\Q$mode_letter\E/ ? 1 : 0;
 }
 
+sub _authoritative_channel_state_for_enforcement {
+  my ($self, $channel) = @_;
+  my $state = $self->_derive_authoritative_channel_state($channel);
+  return $state if ref($state) eq 'HASH';
+  return $self->_derive_authoritative_channel_state($channel, force => 1);
+}
+
 sub _channel_is_moderated_for_client {
   my ($self, $channel, $client) = @_;
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return 0 unless ref($state) eq 'HASH';
   return 0 unless $self->_channel_mode_enabled($state, 'm');
   return 0 if $self->_client_is_authoritative_operator($channel, $client);
@@ -2590,7 +2923,7 @@ sub _channel_is_moderated_for_client {
 
 sub _channel_is_topic_restricted_for_client {
   my ($self, $channel, $client) = @_;
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return 0 unless ref($state) eq 'HASH';
   return 0 unless $self->_channel_mode_enabled($state, 't');
   return 0 if $self->_client_is_authoritative_operator($channel, $client);
@@ -2809,7 +3142,7 @@ sub _handle_authoritative_topic_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -2861,7 +3194,7 @@ sub _handle_authoritative_mode_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -2936,7 +3269,7 @@ sub _handle_authoritative_kick_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -3001,7 +3334,7 @@ sub _handle_authoritative_invite_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)

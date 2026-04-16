@@ -173,7 +173,7 @@ print "\n";
 print "The client auto-joins #overnet. Plain text sends to the current target.\n";
 if (defined $tls_config) {
   my $hexchat_host = _hexchat_connect_host($ready_details->{listen_host});
-  my $hexchat_uri = sprintf('ircs://%s:%d/%%23overnet', $hexchat_host, $ready_details->{listen_port});
+  my $hexchat_uri = sprintf('ircs://%s:%d/#overnet', $hexchat_host, $ready_details->{listen_port});
   print "HexChat can connect without -insecure.\n";
   print "For the local generated cert, run:\n";
   print "  SSL_CERT_FILE=" . _shell_quote($tls_config->{cert_chain_file}) . " hexchat " . _shell_quote($hexchat_uri) . "\n";
