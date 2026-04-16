@@ -1013,6 +1013,7 @@ sub _handle_client_line {
                 command        => 'JOIN',
                 target         => $channel,
                 actor_pubkey   => $self->_client_authoritative_pubkey($client),
+                actor_mask     => $self->_authoritative_irc_mask_for_client($client),
                 (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
                 ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
                 ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
@@ -1036,6 +1037,7 @@ sub _handle_client_line {
               command      => 'JOIN',
               target       => $channel,
               actor_pubkey => $self->_client_authoritative_pubkey($client),
+              actor_mask   => $self->_authoritative_irc_mask_for_client($client),
               (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
               ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
               ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
@@ -1835,6 +1837,9 @@ sub _send_cannot_join_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
+  my $numeric = defined($args{reason}) && !ref($args{reason}) && $args{reason} eq '+b'
+    ? 474
+    : 473;
   my $reason = 'Cannot join channel';
   $reason .= ' (' . $args{reason} . ')'
     if defined $args{reason} && !ref($args{reason}) && length($args{reason});
@@ -1842,11 +1847,46 @@ sub _send_cannot_join_channel {
   return $self->_send_client_line(
     $client_id,
     sprintf(
-      ':%s 473 %s %s :%s',
+      ':%s %d %s %s :%s',
       $self->{config}{server_name},
+      $numeric,
       $self->_client_numeric_target($client),
       $channel,
       $reason,
+    ),
+  );
+}
+
+sub _send_ban_list_entry {
+  my ($self, $client_id, $channel, $ban_mask) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 367 %s %s %s %s 0',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
+      $ban_mask,
+      $self->{config}{server_name},
+    ),
+  );
+}
+
+sub _send_end_of_ban_list {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line(
+    $client_id,
+    sprintf(
+      ':%s 368 %s %s :End of channel ban list',
+      $self->{config}{server_name},
+      $self->_client_numeric_target($client),
+      $channel,
     ),
   );
 }
@@ -2779,6 +2819,7 @@ sub _derive_authoritative_channel_view_from_events {
           target               => $self->_canonical_channel_name($channel),
           authoritative_events => $authoritative_events,
           (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
+          (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
         },
       },
     );
@@ -2801,6 +2842,7 @@ sub _authoritative_channel_state_from_view {
     group_id          => $view->{group_id},
     group_ref         => $view->{group_ref},
     channel_modes     => $view->{channel_modes},
+    (ref($view->{ban_masks}) eq 'ARRAY' ? (ban_masks => [ @{$view->{ban_masks}} ]) : ()),
     (exists $view->{topic} ? (topic => $view->{topic}) : ()),
     (exists $view->{topic_actor_pubkey} ? (topic_actor_pubkey => $view->{topic_actor_pubkey}) : ()),
     supported_roles   => [ @{$view->{supported_roles} || []} ],
@@ -3052,8 +3094,26 @@ sub _authoritative_group_metadata_from_state {
     closed           => $self->_channel_mode_enabled($state, 'i') ? 1 : 0,
     moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
     topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
+    ban_masks        => ref($state->{ban_masks}) eq 'ARRAY' ? [ @{$state->{ban_masks}} ] : [],
     (exists($state->{topic}) ? (topic => $state->{topic}) : ()),
   };
+}
+
+sub _authoritative_irc_mask_for_client {
+  my ($self, $client) = @_;
+  return undef unless ref($client) eq 'HASH';
+  return undef unless defined $client->{nick} && !ref($client->{nick}) && length($client->{nick});
+
+  my $username = defined $client->{username} && !ref($client->{username}) && length($client->{username})
+    ? $client->{username}
+    : $client->{nick};
+  my $host = $self->_presentational_host_for_client($client);
+
+  return Overnet::Authority::HostedChannel::irc_user_mask(
+    nick => $client->{nick},
+    user => $username,
+    host => $host,
+  );
 }
 
 sub _authoritative_topic_line_from_view {
@@ -3095,6 +3155,7 @@ sub _sync_authoritative_topic_state_from_view {
 sub _authoritative_join_admission_for_client {
   my ($self, $channel, $client) = @_;
   my $pubkey = $self->_client_authoritative_pubkey($client);
+  my $actor_mask = $self->_authoritative_irc_mask_for_client($client);
   my $events = $self->_read_authoritative_nip29_events($channel);
   $events = $self->_read_authoritative_nip29_events($channel, force => 1)
     if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled;
@@ -3111,6 +3172,7 @@ sub _authoritative_join_admission_for_client {
     ? $self->_derive_authoritative_channel_view(
         $channel,
         actor_pubkey              => $pubkey,
+        actor_mask                => $actor_mask,
         reconcile_pending_invites => 1,
       )
     : $self->_derive_authoritative_channel_view($channel);
@@ -3120,6 +3182,7 @@ sub _authoritative_join_admission_for_client {
           $channel,
           force                     => 1,
           actor_pubkey              => $pubkey,
+          actor_mask                => $actor_mask,
           reconcile_pending_invites => 1,
         )
       : $self->_derive_authoritative_channel_view($channel, force => 1);
@@ -3335,16 +3398,25 @@ sub _handle_authoritative_mode_command {
   my $state = $self->_authoritative_channel_state_for_enforcement($channel);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
+
+  my $mode = $params[1];
+  return $self->_send_need_more_params($client_id, 'MODE')
+    unless defined $mode && !ref($mode) && length($mode);
+
+  if ($mode eq '+b' && (!defined($params[2]) || ref($params[2]) || !length($params[2]))) {
+    for my $ban_mask (@{$state->{ban_masks} || []}) {
+      $self->_send_ban_list_entry($client_id, $channel, $ban_mask);
+    }
+    $self->_send_end_of_ban_list($client_id, $channel);
+    return 1;
+  }
+
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless $self->_client_is_authoritative_operator($channel, $client);
 
   my $actor_pubkey = $self->_client_authoritative_pubkey($client);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless defined $actor_pubkey;
-
-  my $mode = $params[1];
-  return $self->_send_need_more_params($client_id, 'MODE')
-    unless defined $mode && !ref($mode) && length($mode);
 
   my %input = (
     command      => 'MODE',
@@ -3372,8 +3444,14 @@ sub _handle_authoritative_mode_command {
     $input{target_pubkey} = $target_pubkey;
     $input{current_roles} = [ @{$member->{roles} || []} ];
     $mode_line .= ' ' . $target_nick;
-  } elsif ($mode =~ /\A[+-][imt]\z/) {
+  } elsif ($mode =~ /\A[+-][bimt]\z/) {
     $input{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+    if ($mode =~ /\A[+-]b\z/) {
+      return $self->_send_need_more_params($client_id, 'MODE')
+        unless defined $params[2] && !ref($params[2]) && length($params[2]);
+      $input{ban_mask} = $params[2];
+      $mode_line .= ' ' . $params[2];
+    }
   } else {
     $self->_send_unknown_command($client_id, 'MODE');
     return 1;
@@ -3795,8 +3873,9 @@ sub _publish_authoritative_nip29_event {
     $self->{suppress_subscription_event_ids}{$publish->{event_id}} = 1
       if defined $publish->{event_id} && !ref($publish->{event_id}) && length($publish->{event_id});
     $self->_update_authoritative_channel_cache_with_event(
-      channel => $channel,
-      event   => $event_hash,
+      channel         => $channel,
+      event           => $event_hash,
+      suppress_render => 1,
     );
     return 1;
   }
@@ -3902,6 +3981,7 @@ sub _apply_authoritative_channel_cache_update {
   my $new_view = $args{new_view};
   my $old_state = $args{old_state};
   my $new_state = $args{new_state};
+  my $suppress_render = $args{suppress_render} ? 1 : 0;
   return 0 unless $self->_is_authoritative_channel($channel);
   return 0 unless ref($event) eq 'HASH';
 
@@ -3935,6 +4015,46 @@ sub _apply_authoritative_channel_cache_update {
   my $new_topic_actor = ref($new_view) eq 'HASH' && exists $new_view->{topic_actor_pubkey}
     ? $new_view->{topic_actor_pubkey}
     : undef;
+
+  if (!$suppress_render && ($event->{kind} || 0) == 9002) {
+    my $actor_nick = $self->_authoritative_nick_for_pubkey(
+      $self->_effective_authoritative_actor_pubkey_from_event($event)
+    ) || $self->{config}{server_name};
+
+    my %old_mode_flags = map { $_ => 1 } grep { /[imt]/ } split //, (($old_state->{channel_modes} || '') =~ s/^\+//r);
+    my %new_mode_flags = map { $_ => 1 } grep { /[imt]/ } split //, (($new_state->{channel_modes} || '') =~ s/^\+//r);
+    for my $mode_letter (qw(i m t)) {
+      next if $old_mode_flags{$mode_letter} && $new_mode_flags{$mode_letter};
+      next unless $old_mode_flags{$mode_letter} || $new_mode_flags{$mode_letter};
+      $self->_broadcast_channel_line(
+        $channel,
+        sprintf(
+          ':%s MODE %s %s%s',
+          $actor_nick,
+          $channel,
+          $new_mode_flags{$mode_letter} ? '+' : '-',
+          $mode_letter,
+        ),
+      );
+    }
+
+    my %old_ban_masks = map { $_ => 1 } @{ref($old_state->{ban_masks}) eq 'ARRAY' ? $old_state->{ban_masks} : []};
+    my %new_ban_masks = map { $_ => 1 } @{ref($new_state->{ban_masks}) eq 'ARRAY' ? $new_state->{ban_masks} : []};
+    for my $ban_mask (sort keys %new_ban_masks) {
+      next if $old_ban_masks{$ban_mask};
+      $self->_broadcast_channel_line(
+        $channel,
+        sprintf(':%s MODE %s +b %s', $actor_nick, $channel, $ban_mask),
+      );
+    }
+    for my $ban_mask (sort keys %old_ban_masks) {
+      next if $new_ban_masks{$ban_mask};
+      $self->_broadcast_channel_line(
+        $channel,
+        sprintf(':%s MODE %s -b %s', $actor_nick, $channel, $ban_mask),
+      );
+    }
+  }
 
   if (($event->{kind} || 0) == 9009) {
     my %tags = $self->_first_tag_values($event->{tags});
@@ -4075,6 +4195,7 @@ sub _update_authoritative_channel_cache_with_event {
   my ($self, %args) = @_;
   my $channel = $args{channel};
   my $event = $args{event};
+  my $suppress_render = $args{suppress_render} ? 1 : 0;
   return 0 unless $self->_is_authoritative_channel($channel);
   return 0 unless ref($event) eq 'HASH';
 
@@ -4116,12 +4237,13 @@ sub _update_authoritative_channel_cache_with_event {
 
   $self->_sync_authoritative_topic_state_from_view($canonical, $new_cache->{view});
   $self->_apply_authoritative_channel_cache_update(
-    channel   => $canonical,
-    event     => $event,
-    old_view  => $old_view,
-    new_view  => $new_cache->{view},
-    old_state => $old_state,
-    new_state => $new_cache->{state},
+    channel         => $canonical,
+    event           => $event,
+    old_view        => $old_view,
+    new_view        => $new_cache->{view},
+    old_state       => $old_state,
+    new_state       => $new_cache->{state},
+    suppress_render => $suppress_render,
   );
 
   return 1;
