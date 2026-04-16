@@ -10,6 +10,7 @@ use IO::Socket::SSL ();
 use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
 use Overnet::Authority::Delegation;
+use Overnet::Authority::HostedChannel;
 use Overnet::Core::Nostr;
 use Time::HiRes qw(time);
 use Overnet::Program::Protocol;
@@ -52,7 +53,9 @@ sub new {
     authoritative_last_created_at => {},
     authoritative_delegate_sequences => {},
     authoritative_subscription_channels => {},
+    authoritative_discovered_channels => {},
     authoritative_grant_subscription_id => undef,
+    authoritative_discovery_subscription_id => undef,
     inputs_processed            => 0,
     events_emitted              => 0,
     state_emitted               => 0,
@@ -151,6 +154,8 @@ sub _handle_runtime_init {
 
   my $opened = eval {
     $self->_open_adapter_session;
+    $self->_ensure_authoritative_discovery_subscription;
+    $self->_refresh_authoritative_discovery_cache;
     1;
   };
   if (!$opened) {
@@ -981,6 +986,10 @@ sub _handle_client_line {
     if ($self->_is_authoritative_channel($channel)) {
       $authoritative_join = $self->_authoritative_join_admission_for_client($channel, $client);
       unless ($authoritative_join->{allowed}) {
+        if ($authoritative_join->{auth_required}) {
+          $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH is required for authoritative JOIN');
+          return 1;
+        }
         $self->_send_cannot_join_channel(
           $client_id,
           $channel,
@@ -990,19 +999,23 @@ sub _handle_client_line {
       }
 
       if ($self->_authority_relay_enabled) {
-        if (defined $authoritative_join->{invite_code}
-            && !$self->_client_has_authoritative_delegation($client)) {
+        my $needs_authoritative_join_write = $authoritative_join->{create_channel}
+          || defined($authoritative_join->{invite_code})
+          || !$authoritative_join->{member};
+        if ($needs_authoritative_join_write && !$self->_client_has_authoritative_delegation($client)) {
           $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative JOIN');
           return 1;
         }
-        if (defined $authoritative_join->{invite_code}) {
+        if ($needs_authoritative_join_write) {
           unless ($self->_publish_authoritative_input(
               $client,
               {
-                command      => 'JOIN',
-                target       => $channel,
-                actor_pubkey => $self->_client_authoritative_pubkey($client),
-                invite_code  => $authoritative_join->{invite_code},
+                command        => 'JOIN',
+                target         => $channel,
+                actor_pubkey   => $self->_client_authoritative_pubkey($client),
+                (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
+                ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
+                ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
               },
             )) {
             $self->_send_server_notice(
@@ -1012,26 +1025,33 @@ sub _handle_client_line {
             return 1;
           }
         }
-      } elsif (defined $authoritative_join->{invite_code}) {
-        return 1 unless $self->_emit_client_input(
-          $client,
-          {
-            command      => 'JOIN',
-            target       => $channel,
-            actor_pubkey => $self->_client_authoritative_pubkey($client),
-            invite_code  => $authoritative_join->{invite_code},
-          },
-        );
+      } else {
+        my $needs_authoritative_join_emit = $authoritative_join->{create_channel}
+          || defined($authoritative_join->{invite_code})
+          || !$authoritative_join->{member};
+        if ($needs_authoritative_join_emit) {
+          return 1 unless $self->_emit_client_input(
+            $client,
+            {
+              command      => 'JOIN',
+              target       => $channel,
+              actor_pubkey => $self->_client_authoritative_pubkey($client),
+              (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
+              ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
+              ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
+            },
+          );
+        }
       }
     }
 
     $self->_add_client_to_channel($client_id, $channel);
-    $self->_ensure_channel_subscription($channel);
     $self->_broadcast_channel_line(
       $channel,
       sprintf(':%s JOIN %s', $client->{nick}, $channel),
     );
     $self->_send_join_bootstrap($client_id, $channel);
+    $self->_ensure_channel_subscription($channel);
     if (!$self->_is_authoritative_channel($channel)) {
       $self->_emit_client_input(
         $client,
@@ -2327,11 +2347,11 @@ sub _is_authoritative_channel {
   my ($self, $channel) = @_;
   return 0 unless $self->_authority_profile eq 'nip29';
   return 0 unless $self->_is_channel_name($channel);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  my $channel_groups = $self->{config}{adapter_config}{channel_groups};
-  return 0 unless ref($channel_groups) eq 'HASH';
-  return exists $channel_groups->{$canonical} ? 1 : 0;
+  my $config = $self->{config}{adapter_config} || {};
+  return 0 unless defined $config->{group_host}
+    && !ref($config->{group_host})
+    && length($config->{group_host});
+  return 1;
 }
 
 sub _authoritative_group_binding {
@@ -2341,19 +2361,12 @@ sub _authoritative_group_binding {
   my $canonical = $self->_canonical_channel_name($channel);
   return unless defined $canonical;
 
-  my $config = $self->{config}{adapter_config} || {};
-  my $group_host = $config->{group_host};
-  return unless defined $group_host && !ref($group_host) && length($group_host);
-
-  my $channel_groups = $config->{channel_groups};
-  return unless ref($channel_groups) eq 'HASH';
-  return unless exists $channel_groups->{$canonical};
-
-  my $binding = $channel_groups->{$canonical};
-  my $group_id = ref($binding) eq 'HASH'
-    ? $binding->{group_id}
-    : $binding;
-  return unless defined $group_id && !ref($group_id) && length($group_id);
+  my ($group_host, $group_id) = Overnet::Authority::HostedChannel::resolve_nip29_group_binding(
+    network        => $self->{config}{network},
+    session_config => $self->{config}{adapter_config},
+    target         => $canonical,
+  );
+  return unless defined $group_host && defined $group_id;
 
   return ($group_host, $group_id);
 }
@@ -2372,15 +2385,36 @@ sub _authoritative_nip29_stream_name {
 
 sub _authoritative_channels {
   my ($self) = @_;
+  my %channels;
   my $channel_groups = $self->{config}{adapter_config}{channel_groups};
-  return ()
-    unless ref($channel_groups) eq 'HASH';
-  return sort keys %{$channel_groups};
+  if (ref($channel_groups) eq 'HASH') {
+    for my $channel (sort keys %{$channel_groups}) {
+      my $channel_key = $self->_channel_key($channel);
+      next unless defined $channel_key;
+      $channels{$channel_key} ||= $channel;
+    }
+  }
+  for my $channel (sort keys %{$self->{authoritative_discovered_channels} || {}}) {
+    my $channel_key = $self->_channel_key($channel);
+    next unless defined $channel_key;
+    $channels{$channel_key} ||= $channel;
+  }
+  for my $channel_key (keys %{$self->{channels} || {}}) {
+    my $channel_name = $self->{channels}{$channel_key}{channel_name};
+    next unless $self->_is_authoritative_channel($channel_name);
+    $channels{$channel_key} ||= $channel_name;
+  }
+  return sort values %channels;
 }
 
 sub _authoritative_grant_subscription_id {
   my ($self) = @_;
   return 'irc.authority.grants:' . $self->{config}{network};
+}
+
+sub _authoritative_discovery_subscription_id {
+  my ($self) = @_;
+  return 'irc.authority.discovery:' . $self->{config}{network};
 }
 
 sub _authoritative_channel_subscription_ids {
@@ -2418,6 +2452,34 @@ sub _ensure_authoritative_grant_subscription {
     },
   );
   $self->{authoritative_grant_subscription_id} = $subscription_id;
+  return $subscription_id;
+}
+
+sub _ensure_authoritative_discovery_subscription {
+  my ($self) = @_;
+  return undef unless $self->_authority_relay_enabled;
+  return undef unless $self->_authority_profile eq 'nip29';
+
+  my $subscription_id = $self->{authoritative_discovery_subscription_id}
+    || $self->_authoritative_discovery_subscription_id;
+  return $subscription_id
+    if $self->{authoritative_discovery_subscription_id};
+
+  $self->_request(
+    method => 'nostr.open_subscription',
+    params => {
+      subscription_id => $subscription_id,
+      relay_url       => $self->_authority_relay_url,
+      timeout_ms      => $self->_authority_relay_query_timeout_ms,
+      filters         => [
+        {
+          kinds => [39000],
+          limit => 500,
+        },
+      ],
+    },
+  );
+  $self->{authoritative_discovery_subscription_id} = $subscription_id;
   return $subscription_id;
 }
 
@@ -2492,6 +2554,60 @@ sub _read_nostr_subscription_snapshot {
   return [] if $@;
   return [] unless ref($result->{events}) eq 'ARRAY';
   return [ @{$result->{events}} ];
+}
+
+sub _remember_authoritative_discovered_channel {
+  my ($self, %args) = @_;
+  my $channel = $args{channel};
+  my $group_id = $args{group_id};
+  return 0 unless $self->_is_channel_name($channel);
+  return 0 unless defined $group_id && !ref($group_id) && length($group_id);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return 0 unless defined $canonical;
+
+  $self->{authoritative_discovered_channels}{$canonical} = {
+    channel_name => $channel,
+    group_id     => $group_id,
+    discovered_at => time(),
+  };
+  return 1;
+}
+
+sub _record_authoritative_discovery_event {
+  my ($self, $event) = @_;
+  return 0 unless ref($event) eq 'HASH';
+  my $channel = Overnet::Authority::HostedChannel::channel_name_from_group_event(
+    network => $self->{config}{network},
+    event   => $event,
+  );
+  return 0 unless defined $channel;
+
+  my %tags = $self->_first_tag_values($event->{tags});
+  my $group_id = $tags{d} || $tags{h};
+  return $self->_remember_authoritative_discovered_channel(
+    channel  => $channel,
+    group_id => $group_id,
+  );
+}
+
+sub _refresh_authoritative_discovery_cache {
+  my ($self, %args) = @_;
+  return 0 unless $self->_authority_relay_enabled;
+  return 0 unless $self->_authority_profile eq 'nip29';
+
+  my $subscription_id = $self->_ensure_authoritative_discovery_subscription;
+  return 0 unless defined $subscription_id;
+
+  my $events = $self->_read_nostr_subscription_snapshot(
+    $subscription_id,
+    ($args{refresh} ? (refresh => 1) : ()),
+  );
+  my $count = 0;
+  for my $event (@{$events || []}) {
+    $count += $self->_record_authoritative_discovery_event($event) || 0;
+  }
+  return $count;
 }
 
 sub _query_nostr_events {
@@ -2979,16 +3095,38 @@ sub _sync_authoritative_topic_state_from_view {
 sub _authoritative_join_admission_for_client {
   my ($self, $channel, $client) = @_;
   my $pubkey = $self->_client_authoritative_pubkey($client);
+  my $events = $self->_read_authoritative_nip29_events($channel);
+  $events = $self->_read_authoritative_nip29_events($channel, force => 1)
+    if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled;
+  if (ref($events) eq 'ARRAY' && !@{$events}) {
+    return {
+      allowed      => $pubkey ? 1 : 0,
+      create_channel => $pubkey ? 1 : 0,
+      auth_required => $pubkey ? 0 : 1,
+      reason       => '',
+    };
+  }
+
   my $view = defined $pubkey
     ? $self->_derive_authoritative_channel_view(
         $channel,
-        force                     => 1,
         actor_pubkey              => $pubkey,
         reconcile_pending_invites => 1,
       )
-    : $self->_derive_authoritative_channel_view($channel, force => 1);
+    : $self->_derive_authoritative_channel_view($channel);
+  if (ref($view) ne 'HASH') {
+    $view = defined $pubkey
+      ? $self->_derive_authoritative_channel_view(
+          $channel,
+          force                     => 1,
+          actor_pubkey              => $pubkey,
+          reconcile_pending_invites => 1,
+        )
+      : $self->_derive_authoritative_channel_view($channel, force => 1);
+  }
   return {
     allowed => 0,
+    auth_required => $pubkey ? 0 : 1,
     reason  => '',
   } unless ref($view) eq 'HASH';
 
@@ -3840,6 +3978,31 @@ sub _apply_authoritative_channel_cache_update {
   my $channel_state = $self->{channels}{$channel_key}
     or return 1;
 
+  my %added_pubkeys = map {
+    ($_ => 1)
+  } grep {
+    !$old_present{$_} && $new_present{$_}
+  } keys %new_present;
+
+  for my $pubkey (sort keys %added_pubkeys) {
+    next unless ($event->{kind} || 0) == 9021;
+    next unless (($self->_effective_authoritative_actor_pubkey_from_event($event) || '') eq $pubkey);
+
+    my @local_client_ids = grep {
+      my $client = $self->{clients}{$_};
+      ref($client) eq 'HASH'
+        && (($self->_client_authoritative_pubkey($client) || '') eq $pubkey)
+    } sort keys %{$channel_state->{members} || {}};
+    next if @local_client_ids;
+
+    my $actor_nick = $self->_authoritative_nick_for_pubkey($pubkey)
+      || $self->{config}{server_name};
+    $self->_broadcast_channel_line(
+      $channel,
+      sprintf(':%s JOIN %s', $actor_nick, $channel),
+    );
+  }
+
   my %removed_pubkeys = map {
     ($_ => 1)
   } grep {
@@ -3940,8 +4103,15 @@ sub _update_authoritative_channel_cache_with_event {
       refreshed_at => time(),
     };
   } else {
-    $self->_refresh_authoritative_nip29_channel_cache($canonical);
-    $new_cache = $self->{authoritative_channel_cache}{$canonical} || {};
+    my $sorted_events = $self->_sort_authoritative_events([$event]);
+    my $new_view = $self->_derive_authoritative_channel_view_from_events($canonical, $sorted_events);
+    $new_cache = $self->{authoritative_channel_cache}{$canonical} = {
+      %{$cache},
+      events       => $sorted_events,
+      view         => $new_view,
+      state        => $self->_authoritative_channel_state_from_view($new_view),
+      refreshed_at => time(),
+    };
   }
 
   $self->_sync_authoritative_topic_state_from_view($canonical, $new_cache->{view});
@@ -4078,7 +4248,12 @@ sub _who_entries_for_channel {
 
 sub _list_entries {
   my ($self, $target) = @_;
-  my @channels = map {
+  $self->_refresh_authoritative_discovery_cache(refresh => 1)
+    if $self->_authority_relay_enabled && $self->_authority_profile eq 'nip29';
+
+  my %channels = map {
+    $_ => 1
+  } map {
     $self->{channels}{$_}{channel_name}
   } grep {
     ref($self->{channels}{$_}) eq 'HASH'
@@ -4086,6 +4261,10 @@ sub _list_entries {
       && !ref($self->{channels}{$_}{channel_name})
       && length($self->{channels}{$_}{channel_name})
   } keys %{$self->{channels} || {}};
+  for my $authoritative_channel ($self->_authoritative_channels) {
+    $channels{$authoritative_channel} = 1;
+  }
+  my @channels = sort keys %channels;
 
   if (defined $target && length($target) && $self->_is_channel_name($target)) {
     my $target_key = $self->_channel_key($target);
@@ -4099,6 +4278,52 @@ sub _list_entries {
     my $channel_key = $self->_channel_key($channel);
     next unless defined $channel_key;
     my $state = $self->{channels}{$channel_key};
+
+    if ($self->_is_authoritative_channel($channel)) {
+      my $view = $self->_derive_authoritative_channel_view(
+        $channel,
+        force => 1,
+      );
+      next unless ref($view) eq 'HASH' || ref($state) eq 'HASH';
+
+      my $visible_users = ref($view) eq 'HASH' && ref($view->{present_members}) eq 'ARRAY'
+        ? scalar(@{$view->{present_members}})
+        : 0;
+      if (!$visible_users && ref($state) eq 'HASH') {
+        my %presented_nicks = map { $_ => 1 } $self->_visible_nicks_for_channel($channel);
+        for my $client_id (keys %{$state->{members} || {}}) {
+          next unless exists $self->{clients}{$client_id};
+          my $client = $self->{clients}{$client_id};
+          next unless ref($client) eq 'HASH';
+          next unless $client->{registered};
+          next unless defined $client->{nick} && !ref($client->{nick}) && length($client->{nick});
+          $presented_nicks{$client->{nick}} = 1;
+        }
+        $visible_users = scalar(keys %presented_nicks);
+      }
+
+      my $display_channel = ref($state) eq 'HASH'
+        && defined $state->{channel_name}
+        && !ref($state->{channel_name})
+        && length($state->{channel_name})
+          ? $state->{channel_name}
+          : exists($self->{authoritative_discovered_channels}{$channel})
+          ? $self->{authoritative_discovered_channels}{$channel}{channel_name}
+          : $channel;
+      my $topic = ref($view) eq 'HASH' && exists($view->{topic})
+        ? $view->{topic}
+        : ref($state) eq 'HASH' && defined($state->{topic_text}) && !ref($state->{topic_text})
+        ? $state->{topic_text}
+        : '';
+
+      push @entries, {
+        channel       => $display_channel,
+        visible_users => $visible_users,
+        topic         => $topic,
+      };
+      next;
+    }
+
     next unless ref($state) eq 'HASH';
 
     my %presented_nicks = map { $_ => 1 } $self->_visible_nicks_for_channel($state->{channel_name});
@@ -4361,6 +4586,10 @@ sub _handle_nostr_subscription_event {
   if (($subscription_id || '') eq ($self->{authoritative_grant_subscription_id} || '')) {
     $self->_read_authoritative_grant_events(force => 1);
     return 1;
+  }
+
+  if (($subscription_id || '') eq ($self->{authoritative_discovery_subscription_id} || '')) {
+    return $self->_record_authoritative_discovery_event($params->{data});
   }
 
   my $channel = $self->{authoritative_subscription_channels}{$subscription_id};
