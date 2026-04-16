@@ -1070,6 +1070,14 @@ sub _handle_client_line {
     }
 
     my $reason = @params >= 2 ? $params[1] : undef;
+    if ($self->_is_authoritative_channel($channel)) {
+      return $self->_handle_authoritative_part_command(
+        client_id => $client_id,
+        channel   => $channel,
+        reason    => $reason,
+      );
+    }
+
     my $line = sprintf(':%s PART %s', $client->{nick}, $channel);
     $line .= ' :' . $reason
       if defined $reason && length $reason;
@@ -1997,7 +2005,7 @@ sub _authoritative_relay_filters_for_channel {
       limit => 200,
     },
     {
-      kinds => [ 9000, 9001, 9002, 9009, 9021 ],
+      kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
       '#h'  => [ $group_id ],
       limit => 200,
     },
@@ -2059,8 +2067,9 @@ sub _authoritative_event_sort_rank {
   return 4 if defined $kind && $kind == 9002;
   return 5 if defined $kind && $kind == 9009;
   return 6 if defined $kind && $kind == 9021;
-  return 7 if defined $kind && $kind == 9000;
-  return 8 if defined $kind && $kind == 9001;
+  return 7 if defined $kind && $kind == 9022;
+  return 8 if defined $kind && $kind == 9000;
+  return 9 if defined $kind && $kind == 9001;
   return 99;
 }
 
@@ -2559,6 +2568,55 @@ sub _authoritative_name_entries_for_channel {
     sort { $a->{nick} cmp $b->{nick} } @entries;
 }
 
+sub _handle_authoritative_part_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $reason = $args{reason};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  unless (defined $actor_pubkey) {
+    $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH is required for authoritative PART');
+    return 1;
+  }
+
+  if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
+    $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative PART');
+    return 1;
+  }
+
+  my %input = (
+    command      => 'PART',
+    target       => $channel,
+    actor_pubkey => $actor_pubkey,
+    (defined $reason ? (text => $reason) : ()),
+  );
+  if ($self->_authority_relay_enabled) {
+    unless ($self->_publish_authoritative_input($client, \%input)) {
+      $self->_send_server_notice(
+        $client_id,
+        $self->{authoritative_publish_error} || 'authoritative relay publish failed',
+      );
+      return 1;
+    }
+  } else {
+    return 1 unless $self->_emit_client_input($client, \%input);
+  }
+
+  my $line = sprintf(':%s PART %s', $client->{nick}, $channel);
+  $line .= ' :' . $reason
+    if defined $reason && length $reason;
+  $self->_broadcast_channel_line($channel, $line);
+  $self->_remove_client_from_channel(
+    $client_id,
+    $channel,
+    nick => $client->{nick},
+  );
+  return 1;
+}
+
 sub _handle_authoritative_mode_command {
   my ($self, %args) = @_;
   my $client_id = $args{client_id};
@@ -3038,6 +3096,7 @@ sub _is_authoritative_nip29_event {
     || $kind == 9002
     || $kind == 9009
     || $kind == 9021
+    || $kind == 9022
     || $kind == 39000
     || $kind == 39001
     || $kind == 39002
@@ -3200,12 +3259,18 @@ sub _apply_authoritative_channel_cache_update {
   my $channel_state = $self->{channels}{$channel_key}
     or return 1;
 
-  for my $client_id (sort keys %{$channel_state->{members} || {}}) {
-    my $client = $self->{clients}{$client_id};
-    next unless ref($client) eq 'HASH';
-    my $pubkey = $self->_client_authoritative_pubkey($client);
-    next unless defined $pubkey && $old_members{$pubkey};
-    next if $new_members{$pubkey};
+  my %removed_pubkeys = map {
+    ($_ => 1)
+  } grep {
+    $old_members{$_} && !$new_members{$_}
+  } keys %old_members;
+
+  for my $pubkey (sort keys %removed_pubkeys) {
+    my @affected_client_ids = grep {
+      my $client = $self->{clients}{$_};
+      ref($client) eq 'HASH'
+        && (($self->_client_authoritative_pubkey($client) || '') eq $pubkey)
+    } sort keys %{$channel_state->{members} || {}};
 
     my ($kick_event) = grep {
       my %tags = $self->_first_tag_values($_->{tags});
@@ -3213,24 +3278,57 @@ sub _apply_authoritative_channel_cache_update {
         && defined($tags{p})
         && $tags{p} eq $pubkey;
     } reverse @new_only;
-    my $actor_nick = ref($kick_event) eq 'HASH'
-      ? ($self->_authoritative_nick_for_pubkey(
-          $self->_effective_authoritative_actor_pubkey_from_event($kick_event)
-        ) || $self->{config}{server_name})
-      : $self->{config}{server_name};
-    my $reason = ref($kick_event) eq 'HASH'
-      ? $kick_event->{content}
-      : undef;
+    if (ref($kick_event) eq 'HASH') {
+      my $target_nick = @affected_client_ids
+        ? $self->{clients}{$affected_client_ids[0]}{nick}
+        : $self->_authoritative_nick_for_pubkey($pubkey);
+      next unless defined $target_nick && length $target_nick;
 
-    my $line = sprintf(':%s KICK %s %s', $actor_nick, $channel, $client->{nick});
+      my $actor_nick = $self->_authoritative_nick_for_pubkey(
+        $self->_effective_authoritative_actor_pubkey_from_event($kick_event)
+      ) || $self->{config}{server_name};
+      my $reason = $kick_event->{content};
+      my $line = sprintf(':%s KICK %s %s', $actor_nick, $channel, $target_nick);
+      $line .= ' :' . $reason
+        if defined $reason && !ref($reason) && length($reason);
+      $self->_broadcast_channel_line($channel, $line);
+
+      for my $client_id (@affected_client_ids) {
+        next unless exists $self->{clients}{$client_id};
+        $self->_remove_client_from_channel(
+          $client_id,
+          $channel,
+          nick => $self->{clients}{$client_id}{nick},
+        );
+      }
+      next;
+    }
+
+    my ($leave_event) = grep {
+      (($_->{kind} || 0) == 9022)
+        && (($self->_effective_authoritative_actor_pubkey_from_event($_) || '') eq $pubkey);
+    } reverse @new_only;
+    next unless ref($leave_event) eq 'HASH';
+
+    my $actor_nick = @affected_client_ids
+      ? $self->{clients}{$affected_client_ids[0]}{nick}
+      : ($self->_authoritative_nick_for_pubkey($pubkey) || $self->{config}{server_name});
+    my $reason = $leave_event->{content};
+    my $line = sprintf(':%s PART %s', $actor_nick, $channel);
     $line .= ' :' . $reason
       if defined $reason && !ref($reason) && length($reason);
     $self->_broadcast_channel_line($channel, $line);
-    $self->_remove_client_from_channel(
-      $client_id,
-      $channel,
-      nick => $client->{nick},
-    );
+
+    for my $client_id (@affected_client_ids) {
+      next unless exists $self->{clients}{$client_id};
+      $self->_remove_client_from_channel(
+        $client_id,
+        $channel,
+        nick => $self->{clients}{$client_id}{nick},
+      );
+    }
+    $channel_state = $self->{channels}{$channel_key}
+      or return 1;
   }
 
   return 1;
