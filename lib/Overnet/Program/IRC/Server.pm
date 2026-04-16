@@ -1203,6 +1203,14 @@ sub _handle_client_line {
       return 1;
     }
 
+    if ($self->_is_authoritative_channel($channel)) {
+      return $self->_handle_authoritative_topic_command(
+        client_id => $client_id,
+        channel   => $channel,
+        text      => $params[1],
+      );
+    }
+
     $self->_emit_client_input(
       $client,
       {
@@ -1661,11 +1669,41 @@ sub _send_topic_reply {
 
   my $channel_key = $self->_channel_key($display_channel);
   return 0 unless defined $channel_key;
-  my $state = $self->{channels}{$channel_key}
-    || $self->_channel_state($display_channel);
   my $target = $self->_client_numeric_target($client);
 
-  if (defined $state->{topic_text} && !ref($state->{topic_text}) && length($state->{topic_text})) {
+  if ($self->_is_authoritative_channel($display_channel)) {
+    my $view = $self->_derive_authoritative_channel_view($display_channel);
+    $view = $self->_derive_authoritative_channel_view($display_channel, force => 1)
+      unless ref($view) eq 'HASH';
+    $self->_sync_authoritative_topic_state_from_view($display_channel, $view);
+    if (ref($view) eq 'HASH' && exists $view->{topic}) {
+      return $self->_send_client_line(
+        $client_id,
+        sprintf(
+          ':%s 332 %s %s :%s',
+          $self->{config}{server_name},
+          $target,
+          $display_channel,
+          $view->{topic},
+        ),
+      );
+    }
+
+    return $self->_send_client_line(
+      $client_id,
+      sprintf(
+        ':%s 331 %s %s :No topic is set',
+        $self->{config}{server_name},
+        $target,
+        $display_channel,
+      ),
+    );
+  }
+
+  my $state = $self->{channels}{$channel_key}
+    || $self->_channel_state($display_channel);
+
+  if (defined $state->{topic_text} && !ref($state->{topic_text})) {
     return $self->_send_client_line(
       $client_id,
       sprintf(
@@ -2256,6 +2294,7 @@ sub _refresh_authoritative_nip29_channel_cache {
   $cache->{view} = $view;
   $cache->{state} = $self->_authoritative_channel_state_from_view($view);
   $cache->{refreshed_at} = time();
+  $self->_sync_authoritative_topic_state_from_view($canonical, $view);
 
   return $events;
 }
@@ -2320,6 +2359,8 @@ sub _authoritative_channel_state_from_view {
     group_id          => $view->{group_id},
     group_ref         => $view->{group_ref},
     channel_modes     => $view->{channel_modes},
+    (exists $view->{topic} ? (topic => $view->{topic}) : ()),
+    (exists $view->{topic_actor_pubkey} ? (topic_actor_pubkey => $view->{topic_actor_pubkey}) : ()),
     supported_roles   => [ @{$view->{supported_roles} || []} ],
     members           => [
       map { +{
@@ -2562,7 +2603,44 @@ sub _authoritative_group_metadata_from_state {
     closed           => $self->_channel_mode_enabled($state, 'i') ? 1 : 0,
     moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
     topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
+    (exists($state->{topic}) ? (topic => $state->{topic}) : ()),
   };
+}
+
+sub _authoritative_topic_line_from_view {
+  my ($self, $channel, $view) = @_;
+  return undef unless ref($view) eq 'HASH';
+  return undef unless exists $view->{topic};
+
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return undef unless defined $display_channel;
+
+  my $prefix = $self->{config}{server_name};
+  if (defined $view->{topic_actor_pubkey}
+      && !ref($view->{topic_actor_pubkey})
+      && $view->{topic_actor_pubkey} =~ /\A[0-9a-f]{64}\z/) {
+    $prefix = $self->_authoritative_nick_for_pubkey($view->{topic_actor_pubkey})
+      || $prefix;
+  }
+
+  return sprintf(':%s TOPIC %s :%s', $prefix, $display_channel, $view->{topic});
+}
+
+sub _sync_authoritative_topic_state_from_view {
+  my ($self, $channel, $view) = @_;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
+
+  my $state = $self->_channel_state($display_channel);
+  if (ref($view) eq 'HASH' && exists $view->{topic}) {
+    $state->{topic_text} = $view->{topic};
+    $state->{topic_line} = $self->_authoritative_topic_line_from_view($display_channel, $view);
+  } else {
+    $state->{topic_text} = undef;
+    $state->{topic_line} = undef;
+  }
+
+  return 1;
 }
 
 sub _authoritative_join_admission_for_client {
@@ -2720,6 +2798,58 @@ sub _handle_authoritative_part_command {
     $channel,
     nick => $client->{nick},
   );
+  return 1;
+}
+
+sub _handle_authoritative_topic_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $text = $args{text};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
+    $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative TOPIC');
+    return 1;
+  }
+
+  my %input = (
+    command        => 'TOPIC',
+    target         => $channel,
+    actor_pubkey   => $actor_pubkey,
+    text           => $text,
+    group_metadata => $self->_authoritative_group_metadata_from_state($state),
+  );
+  if ($self->_authority_relay_enabled) {
+    unless ($self->_publish_authoritative_input($client, \%input)) {
+      $self->_send_server_notice(
+        $client_id,
+        $self->{authoritative_publish_error} || 'authoritative relay publish failed',
+      );
+      return 1;
+    }
+  } else {
+    return 1 unless $self->_emit_client_input($client, \%input);
+    $self->_refresh_authoritative_nip29_channel_cache($channel);
+  }
+
+  if (!$self->_authority_relay_enabled) {
+    my $line = sprintf(':%s TOPIC %s :%s', $client->{nick}, $channel, $text);
+    $self->_broadcast_channel_line($channel, $line);
+    $self->_channel_state($channel)->{topic_text} = $text;
+    $self->_channel_state($channel)->{topic_line} = $line;
+  }
   return 1;
 }
 
@@ -3193,6 +3323,10 @@ sub _publish_authoritative_nip29_event {
 
     $self->{suppress_subscription_event_ids}{$publish->{event_id}} = 1
       if defined $publish->{event_id} && !ref($publish->{event_id}) && length($publish->{event_id});
+    $self->_update_authoritative_channel_cache_with_event(
+      channel => $channel,
+      event   => $event_hash,
+    );
     return 1;
   }
 
@@ -3320,6 +3454,16 @@ sub _apply_authoritative_channel_cache_update {
   } grep {
     ref($_) eq 'HASH' && defined($_->{pubkey})
   } @{ref($new_view) eq 'HASH' ? ($new_view->{present_members} || []) : []};
+  my $old_has_topic = ref($old_view) eq 'HASH' && exists $old_view->{topic} ? 1 : 0;
+  my $new_has_topic = ref($new_view) eq 'HASH' && exists $new_view->{topic} ? 1 : 0;
+  my $old_topic = $old_has_topic ? $old_view->{topic} : undef;
+  my $new_topic = $new_has_topic ? $new_view->{topic} : undef;
+  my $old_topic_actor = ref($old_view) eq 'HASH' && exists $old_view->{topic_actor_pubkey}
+    ? $old_view->{topic_actor_pubkey}
+    : undef;
+  my $new_topic_actor = ref($new_view) eq 'HASH' && exists $new_view->{topic_actor_pubkey}
+    ? $new_view->{topic_actor_pubkey}
+    : undef;
 
   if (($event->{kind} || 0) == 9009) {
     my %tags = $self->_first_tag_values($event->{tags});
@@ -3345,6 +3489,17 @@ sub _apply_authoritative_channel_cache_update {
       );
     }
     return 1;
+  }
+
+  if ($old_has_topic != $new_has_topic
+      || (($old_topic // '') ne ($new_topic // ''))
+      || (($old_topic_actor // '') ne ($new_topic_actor // ''))) {
+    $self->_sync_authoritative_topic_state_from_view($channel, $new_view);
+    if ($new_has_topic) {
+      my $line = $self->_authoritative_topic_line_from_view($channel, $new_view);
+      $self->_broadcast_channel_line($channel, $line)
+        if defined $line && length $line;
+    }
   }
 
   my $channel_key = $self->_channel_key($channel);
@@ -3416,6 +3571,55 @@ sub _apply_authoritative_channel_cache_update {
     $channel_state = $self->{channels}{$channel_key}
       or return 1;
   }
+
+  return 1;
+}
+
+sub _update_authoritative_channel_cache_with_event {
+  my ($self, %args) = @_;
+  my $channel = $args{channel};
+  my $event = $args{event};
+  return 0 unless $self->_is_authoritative_channel($channel);
+  return 0 unless ref($event) eq 'HASH';
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return 0 unless defined $canonical;
+
+  my $cache = $self->{authoritative_channel_cache}{$canonical} || {};
+  my $old_view = $cache->{view};
+  my $old_state = $cache->{state};
+  my $event_id = defined($event->{id}) && !ref($event->{id}) && length($event->{id})
+    ? $event->{id}
+    : undef;
+  my $new_cache;
+  if (ref($cache->{events}) eq 'ARRAY') {
+    my @events = @{$cache->{events}};
+    if (!defined($event_id) || !grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $event_id } @events) {
+      push @events, $event;
+    }
+    my $sorted_events = $self->_sort_authoritative_events(\@events);
+    my $new_view = $self->_derive_authoritative_channel_view_from_events($canonical, $sorted_events);
+    $new_cache = $self->{authoritative_channel_cache}{$canonical} = {
+      %{$cache},
+      events       => $sorted_events,
+      view         => $new_view,
+      state        => $self->_authoritative_channel_state_from_view($new_view),
+      refreshed_at => time(),
+    };
+  } else {
+    $self->_refresh_authoritative_nip29_channel_cache($canonical);
+    $new_cache = $self->{authoritative_channel_cache}{$canonical} || {};
+  }
+
+  $self->_sync_authoritative_topic_state_from_view($canonical, $new_cache->{view});
+  $self->_apply_authoritative_channel_cache_update(
+    channel   => $canonical,
+    event     => $event,
+    old_view  => $old_view,
+    new_view  => $new_cache->{view},
+    old_state => $old_state,
+    new_state => $new_cache->{state},
+  );
 
   return 1;
 }
@@ -3828,45 +4032,10 @@ sub _handle_nostr_subscription_event {
 
   my $channel = $self->{authoritative_subscription_channels}{$subscription_id};
   return 0 unless defined $channel;
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return 0 unless defined $canonical;
-
-  my $cache = $self->{authoritative_channel_cache}{$canonical} || {};
-  my $old_view = $cache->{view};
-  my $old_state = $cache->{state};
-  my $event_id = defined($params->{data}{id}) && !ref($params->{data}{id}) && length($params->{data}{id})
-    ? $params->{data}{id}
-    : undef;
-  my $new_cache;
-  if (ref($cache->{events}) eq 'ARRAY') {
-    my @events = @{$cache->{events}};
-    if (!defined($event_id) || !grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $event_id } @events) {
-      push @events, $params->{data};
-    }
-    my $sorted_events = $self->_sort_authoritative_events(\@events);
-    my $new_view = $self->_derive_authoritative_channel_view_from_events($canonical, $sorted_events);
-    $new_cache = $self->{authoritative_channel_cache}{$canonical} = {
-      %{$cache},
-      events       => $sorted_events,
-      view         => $new_view,
-      state        => $self->_authoritative_channel_state_from_view($new_view),
-      refreshed_at => time(),
-    };
-  } else {
-    $self->_refresh_authoritative_nip29_channel_cache($canonical);
-    $new_cache = $self->{authoritative_channel_cache}{$canonical} || {};
-  }
-  $self->_apply_authoritative_channel_cache_update(
-    channel   => $canonical,
-    event     => $params->{data},
-    old_view  => $old_view,
-    new_view  => $new_cache->{view},
-    old_state => $old_state,
-    new_state => $new_cache->{state},
+  return $self->_update_authoritative_channel_cache_with_event(
+    channel => $channel,
+    event   => $params->{data},
   );
-
-  return 1;
 }
 
 sub _render_subscription_item {
@@ -4737,6 +4906,17 @@ sub _send_names_list {
 
 sub _send_join_bootstrap {
   my ($self, $client_id, $channel) = @_;
+  if ($self->_is_authoritative_channel($channel)) {
+    my $view = $self->_derive_authoritative_channel_view($channel);
+    $view = $self->_derive_authoritative_channel_view($channel, force => 1)
+      unless ref($view) eq 'HASH';
+    $self->_sync_authoritative_topic_state_from_view($channel, $view);
+    my $line = $self->_authoritative_topic_line_from_view($channel, $view);
+    $self->_send_client_line($client_id, $line)
+      if defined $line && length $line;
+    return $self->_send_names_list($client_id, $channel);
+  }
+
   my $channel_key = $self->_channel_key($channel);
   return 0 unless defined $channel_key;
   my $state = $self->{channels}{$channel_key}
