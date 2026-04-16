@@ -9,6 +9,7 @@ use IO::Socket::INET;
 use IO::Socket::SSL ();
 use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
+use Overnet::Authority::Delegation;
 use Overnet::Core::Nostr;
 use Time::HiRes qw(time);
 use Overnet::Program::Protocol;
@@ -48,6 +49,10 @@ sub new {
     channels                    => {},
     nick_to_client_id           => {},
     suppress_subscription_event_ids => {},
+    authoritative_last_created_at => {},
+    authoritative_delegate_sequences => {},
+    authoritative_subscription_channels => {},
+    authoritative_grant_subscription_id => undef,
     inputs_processed            => 0,
     events_emitted              => 0,
     state_emitted               => 0,
@@ -253,6 +258,12 @@ sub _load_runtime_init {
           && !ref($authority_relay->{poll_interval_ms})
           && $authority_relay->{poll_interval_ms} =~ /\A[1-9]\d*\z/;
     }
+    if (exists $authority_relay->{query_timeout_ms}) {
+      die "config.authority_relay.query_timeout_ms must be a positive integer\n"
+        unless defined $authority_relay->{query_timeout_ms}
+          && !ref($authority_relay->{query_timeout_ms})
+          && $authority_relay->{query_timeout_ms} =~ /\A[1-9]\d*\z/;
+    }
   }
 
   my $signing_key = Overnet::Core::Nostr->load_key(privkey => $signing_key_file);
@@ -274,6 +285,9 @@ sub _load_runtime_init {
           poll_interval_ms => exists $authority_relay->{poll_interval_ms}
             ? 0 + $authority_relay->{poll_interval_ms}
             : 250,
+          query_timeout_ms => exists $authority_relay->{query_timeout_ms}
+            ? 0 + $authority_relay->{query_timeout_ms}
+            : 1_000,
         },
       )
       : ()),
@@ -325,9 +339,8 @@ sub _run_server_loop {
 
   my $ok = eval {
     while (!$self->{shutdown_complete}) {
-      my $drained = $self->_drain_pending_runtime_messages;
+      my $drained = $self->_drain_pending_runtime_messages(max_messages => 8);
       last if $self->{shutdown_complete};
-      next if $drained;
 
       my @handles = (\*STDIN);
       push @handles, $self->{listener_socket}
@@ -351,7 +364,7 @@ sub _run_server_loop {
 
         if ($self->_is_runtime_stdin($handle)) {
           $self->_read_runtime_chunk;
-          $self->_drain_pending_runtime_messages;
+          $self->_drain_pending_runtime_messages(max_messages => 8);
           last if $self->{shutdown_complete};
           next;
         }
@@ -650,34 +663,32 @@ sub _handle_client_line {
         return 1;
       }
 
-      my $event = Overnet::Core::Nostr->event_from_wire($event_hash);
-      unless ($event && eval { $event->validate; 1 }) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a valid signed Nostr event');
-        return 1;
-      }
-      unless ($event->kind == 22242) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires kind 22242');
-        return 1;
-      }
-
-      my %tags = $self->_first_tag_values($event->tags);
-      unless (defined $tags{challenge} && $tags{challenge} eq $challenge) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH challenge does not match');
-        return 1;
-      }
-
-      my $scope = $self->_authoritative_auth_scope;
-      unless (defined $tags{relay} && $tags{relay} eq $scope) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH relay scope does not match');
+      my $validation = Overnet::Authority::Delegation->verify_auth_event(
+        challenge => $challenge,
+        scope     => $self->_authoritative_auth_scope,
+        event     => $event_hash,
+      );
+      unless ($validation->{valid}) {
+        my $reason = $validation->{reason} || '';
+        my $message = $reason =~ /kind 22242/i
+          ? 'OVERNETAUTH AUTH requires kind 22242'
+          : $reason =~ /challenge/i
+          ? 'OVERNETAUTH AUTH challenge does not match'
+          : $reason =~ /relay scope/i
+          ? 'OVERNETAUTH AUTH relay scope does not match'
+          : 'OVERNETAUTH AUTH requires a valid signed Nostr event';
+        $self->_send_server_notice($client_id, $message);
         return 1;
       }
 
-      $client->{authority_pubkey} = $event->pubkey;
+      $client->{authority_pubkey} = $validation->{pubkey};
       delete $client->{authority_delegate_key};
       delete $client->{authority_delegate_session_id};
       delete $client->{authority_delegate_expires_at};
       delete $client->{authority_delegate_event_id};
       delete $client->{authority_delegate_sequence};
+      delete $self->{authoritative_last_created_at}{$client_id};
+      delete $self->{authoritative_delegate_sequences}{$client_id};
       delete $client->{authority_challenge};
       $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH ' . $client->{authority_pubkey});
       return 1;
@@ -732,46 +743,44 @@ sub _handle_client_line {
         return 1;
       }
 
-      my $event = Overnet::Core::Nostr->event_from_wire($event_hash);
-      unless ($event && eval { $event->validate; 1 }) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE requires a valid signed Nostr event');
-        return 1;
-      }
-      unless ($event->kind == $self->_authority_grant_kind) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE uses the wrong event kind');
-        return 1;
-      }
-      unless ($event->pubkey eq $client->{authority_pubkey}) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE pubkey does not match the authenticated user');
-        return 1;
-      }
-
-      my %tags = $self->_first_tag_values($event->tags);
-      unless (defined $tags{relay} && $tags{relay} eq $self->_authority_relay_url) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE relay does not match');
-        return 1;
-      }
-      unless (defined $tags{server} && $tags{server} eq $self->_authoritative_auth_scope) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE server scope does not match');
-        return 1;
-      }
-      unless (defined $tags{delegate} && $tags{delegate} eq $delegate_key->pubkey_hex) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE delegate pubkey does not match');
-        return 1;
-      }
-      unless (defined $tags{session} && $tags{session} eq $delegate_session_id) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE session does not match');
-        return 1;
-      }
-      unless (defined $tags{expires_at} && $tags{expires_at} =~ /\A\d+\z/ && $tags{expires_at} == $delegate_expires_at) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE expiration does not match');
+      my $validation = Overnet::Authority::Delegation->verify_delegation_grant(
+        authority_pubkey => $client->{authority_pubkey},
+        relay_url        => $self->_authority_relay_url,
+        scope            => $self->_authoritative_auth_scope,
+        delegate_pubkey  => $delegate_key->pubkey_hex,
+        session_id       => $delegate_session_id,
+        expires_at       => $delegate_expires_at,
+        kind             => $self->_authority_grant_kind,
+        event            => $event_hash,
+      );
+      unless ($validation->{valid}) {
+        my $reason = $validation->{reason} || '';
+        my $message = $reason =~ /wrong event kind/i
+          ? 'OVERNETAUTH DELEGATE uses the wrong event kind'
+          : $reason =~ /authenticated user/i
+          ? 'OVERNETAUTH DELEGATE pubkey does not match the authenticated user'
+          : $reason =~ /relay does not match/i
+          ? 'OVERNETAUTH DELEGATE relay does not match'
+          : $reason =~ /server scope/i
+          ? 'OVERNETAUTH DELEGATE server scope does not match'
+          : $reason =~ /delegate pubkey/i
+          ? 'OVERNETAUTH DELEGATE delegate pubkey does not match'
+          : $reason =~ /session does not match/i
+          ? 'OVERNETAUTH DELEGATE session does not match'
+          : $reason =~ /expiration does not match/i
+          ? 'OVERNETAUTH DELEGATE expiration does not match'
+          : 'OVERNETAUTH DELEGATE requires a valid signed Nostr event';
+        $self->_send_server_notice($client_id, $message);
         return 1;
       }
 
       my $publish = eval {
-        Overnet::Core::Nostr->publish_event(
-          relay_url => $self->_authority_relay_url,
-          event     => $event,
+        $self->_request(
+          method => 'nostr.publish_event',
+          params => {
+            relay_url => $self->_authority_relay_url,
+            event     => $validation->{event},
+          },
         );
       };
       if ($@ || ref($publish) ne 'HASH' || !$publish->{accepted}) {
@@ -779,8 +788,10 @@ sub _handle_client_line {
         return 1;
       }
 
-      $client->{authority_delegate_event_id} = $event->id;
+      $client->{authority_delegate_event_id} = $validation->{event_id};
       $client->{authority_delegate_sequence} = 0;
+      $self->{authoritative_last_created_at}{$client_id} = 0;
+      $self->{authoritative_delegate_sequences}{$client_id} = 0;
       $self->_read_authoritative_grant_events(force => 1);
       $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE');
       return 1;
@@ -1514,7 +1525,7 @@ sub _send_channel_mode_is {
   return 0 unless defined $display_channel;
   my $channel_modes = '+n';
 
-  if (my $authoritative = $self->_derive_authoritative_channel_state($display_channel)) {
+  if (my $authoritative = $self->_derive_authoritative_channel_state($display_channel, force => 1)) {
     $channel_modes = $authoritative->{channel_modes}
       if defined $authoritative->{channel_modes}
         && !ref($authoritative->{channel_modes})
@@ -1887,6 +1898,17 @@ sub _authority_relay_poll_interval_ms {
   return $config->{poll_interval_ms};
 }
 
+sub _authority_relay_query_timeout_ms {
+  my ($self) = @_;
+  my $config = $self->_authority_relay_config;
+  my $timeout_ms = ref($config) eq 'HASH'
+    ? $config->{query_timeout_ms}
+    : undef;
+  $timeout_ms = 1_000
+    unless defined $timeout_ms && !ref($timeout_ms) && $timeout_ms =~ /\A[1-9]\d*\z/;
+  return $timeout_ms;
+}
+
 sub _authority_relay_enabled {
   my ($self) = @_;
   my $url = $self->_authority_relay_url;
@@ -1992,85 +2014,142 @@ sub _authoritative_channels {
   return sort keys %{$channel_groups};
 }
 
-sub _authoritative_relay_filters_for_channel {
-  my ($self, $channel) = @_;
-  my (undef, $group_id) = $self->_authoritative_group_binding($channel);
-  return ()
-    unless defined $group_id;
+sub _authoritative_grant_subscription_id {
+  my ($self) = @_;
+  return 'irc.authority.grants:' . $self->{config}{network};
+}
 
+sub _authoritative_channel_subscription_ids {
+  my ($self, $channel) = @_;
+  my ($group_host, $group_id) = $self->_authoritative_group_binding($channel);
+  return ()
+    unless defined $group_host && defined $group_id;
   return (
-    {
-      kinds => [ 39000, 39001, 39002, 39003 ],
-      '#d'  => [ $group_id ],
-      limit => 200,
-    },
-    {
-      kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
-      '#h'  => [ $group_id ],
-      limit => 200,
-    },
+    join(':', 'irc.authority.meta', $self->{config}{network}, $group_host, $group_id),
+    join(':', 'irc.authority.control', $self->{config}{network}, $group_host, $group_id),
   );
 }
 
-sub _sort_authoritative_events {
-  my ($self, $events) = @_;
-  my @decorated;
-  my $index = 0;
-  for my $event (@{$events || []}) {
-    push @decorated, [ $index++, $event ];
+sub _ensure_authoritative_grant_subscription {
+  my ($self) = @_;
+  return undef unless $self->_authority_relay_enabled;
+
+  my $subscription_id = $self->{authoritative_grant_subscription_id}
+    || $self->_authoritative_grant_subscription_id;
+  return $subscription_id
+    if $self->{authoritative_grant_subscription_id};
+
+  $self->_request(
+    method => 'nostr.open_subscription',
+    params => {
+      subscription_id => $subscription_id,
+      relay_url       => $self->_authority_relay_url,
+      timeout_ms      => $self->_authority_relay_query_timeout_ms,
+      filters         => [
+        {
+          kinds => [ $self->_authority_grant_kind ],
+          limit => 200,
+        },
+      ],
+    },
+  );
+  $self->{authoritative_grant_subscription_id} = $subscription_id;
+  return $subscription_id;
+}
+
+sub _ensure_authoritative_channel_subscription {
+  my ($self, $channel) = @_;
+  return undef unless $self->_authority_relay_enabled;
+  return undef unless $self->_is_authoritative_channel($channel);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my (undef, $group_id) = $self->_authoritative_group_binding($canonical);
+  return undef unless defined $group_id;
+
+  my @subscription_specs = (
+    [
+      ($self->_authoritative_channel_subscription_ids($canonical))[0],
+      [
+        {
+          kinds => [ 39000, 39001, 39002, 39003 ],
+          '#d'  => [ $group_id ],
+          limit => 200,
+        },
+      ],
+    ],
+    [
+      ($self->_authoritative_channel_subscription_ids($canonical))[1],
+      [
+        {
+          kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
+          '#h'  => [ $group_id ],
+          limit => 200,
+        },
+      ],
+    ],
+  );
+
+  my @subscription_ids;
+  for my $spec (@subscription_specs) {
+    my ($subscription_id, $filters) = @{$spec};
+    next unless defined $subscription_id;
+    if (!$self->{authoritative_subscription_channels}{$subscription_id}) {
+      $self->_request(
+        method => 'nostr.open_subscription',
+        params => {
+          subscription_id => $subscription_id,
+          relay_url       => $self->_authority_relay_url,
+          timeout_ms      => $self->_authority_relay_query_timeout_ms,
+          filters         => $filters,
+        },
+      );
+      $self->{authoritative_subscription_channels}{$subscription_id} = $canonical;
+    }
+    push @subscription_ids, $subscription_id;
   }
-  return [
-    map { $_->[1] } sort {
-      ((($a->[1]{created_at}) || 0) <=> (($b->[1]{created_at}) || 0))
-        || (
-          defined _authoritative_event_sequence_for_sort($self, $a->[1])
-            && defined _authoritative_event_sequence_for_sort($self, $b->[1])
-            && ((_authoritative_event_authority_for_sort($self, $a->[1]) || '') eq (_authoritative_event_authority_for_sort($self, $b->[1]) || ''))
-              ? (_authoritative_event_sequence_for_sort($self, $a->[1]) <=> _authoritative_event_sequence_for_sort($self, $b->[1]))
-              : (_authoritative_event_sort_rank($self, $a->[1]) <=> _authoritative_event_sort_rank($self, $b->[1]))
-        )
-        || ($a->[0] <=> $b->[0])
-    } @decorated
-  ];
+
+  return \@subscription_ids;
 }
 
-sub _authoritative_event_authority_for_sort {
-  my ($self, $event) = @_;
-  return undef unless ref($event) eq 'HASH';
-  my %tags = $self->_first_tag_values($event->{tags});
-  return $tags{overnet_authority}
-    if defined $tags{overnet_authority}
-      && !ref($tags{overnet_authority})
-      && $tags{overnet_authority} =~ /\A[0-9a-f]{64}\z/;
-  return undef;
+sub _read_nostr_subscription_snapshot {
+  my ($self, $subscription_id, %args) = @_;
+  return [] unless defined $subscription_id && !ref($subscription_id) && length($subscription_id);
+
+  my $result = eval {
+    $self->_request(
+      method => 'nostr.read_subscription_snapshot',
+      params => {
+        subscription_id => $subscription_id,
+        (defined $args{refresh} ? (refresh => $args{refresh} ? 1 : 0) : ()),
+      },
+    );
+  };
+  return [] if $@;
+  return [] unless ref($result->{events}) eq 'ARRAY';
+  return [ @{$result->{events}} ];
 }
 
-sub _authoritative_event_sequence_for_sort {
-  my ($self, $event) = @_;
-  return undef unless ref($event) eq 'HASH';
-  my %tags = $self->_first_tag_values($event->{tags});
-  return 0 + $tags{overnet_sequence}
-    if defined $tags{overnet_sequence}
-      && !ref($tags{overnet_sequence})
-      && $tags{overnet_sequence} =~ /\A[1-9]\d*\z/;
-  return undef;
-}
+sub _query_nostr_events {
+  my ($self, %args) = @_;
+  my $relay_url = $args{relay_url};
+  my $filters = $args{filters};
+  return [] unless defined $relay_url && !ref($relay_url) && length($relay_url);
+  return [] unless ref($filters) eq 'ARRAY' && @{$filters};
 
-sub _authoritative_event_sort_rank {
-  my ($self, $event) = @_;
-  return 99 unless ref($event) eq 'HASH';
-  my $kind = $event->{kind};
-  return 0 if defined $kind && $kind == 39000;
-  return 1 if defined $kind && $kind == 39001;
-  return 2 if defined $kind && $kind == 39002;
-  return 3 if defined $kind && $kind == 39003;
-  return 4 if defined $kind && $kind == 9002;
-  return 5 if defined $kind && $kind == 9009;
-  return 6 if defined $kind && $kind == 9021;
-  return 7 if defined $kind && $kind == 9022;
-  return 8 if defined $kind && $kind == 9000;
-  return 9 if defined $kind && $kind == 9001;
-  return 99;
+  my $result = eval {
+    $self->_request(
+      method => 'nostr.query_events',
+      params => {
+        relay_url => $relay_url,
+        filters   => $filters,
+        (defined $args{timeout_ms} ? (timeout_ms => $args{timeout_ms}) : ()),
+      },
+    );
+  };
+  return [] if $@;
+  return [] unless ref($result->{events}) eq 'ARRAY';
+  return [ @{$result->{events}} ];
 }
 
 sub _read_authoritative_nip29_events_from_runtime {
@@ -2096,6 +2175,70 @@ sub _read_authoritative_nip29_events_from_runtime {
   ];
 }
 
+sub _load_authoritative_nip29_events {
+  my ($self, $channel, %args) = @_;
+  return [] unless $self->_is_authoritative_channel($channel);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return [] unless defined $canonical;
+
+  if ($self->_authority_relay_enabled) {
+    my $subscription_ids = $self->_ensure_authoritative_channel_subscription($canonical);
+    return [] unless ref($subscription_ids) eq 'ARRAY' && @{$subscription_ids};
+
+    if ($args{refresh}) {
+      my (undef, $group_id) = $self->_authoritative_group_binding($canonical);
+      return [] unless defined $group_id;
+
+      my @events;
+      my %seen_ids;
+      for my $filters (
+        [
+          {
+            kinds => [ 39000, 39001, 39002, 39003 ],
+            '#d'  => [ $group_id ],
+            limit => 200,
+          },
+        ],
+        [
+          {
+            kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
+            '#h'  => [ $group_id ],
+            limit => 200,
+          },
+        ],
+      ) {
+        my $queried = $self->_query_nostr_events(
+          relay_url => $self->_authority_relay_url,
+          filters   => $filters,
+          timeout_ms => $self->_authority_relay_query_timeout_ms,
+        );
+        for my $event (@{$queried || []}) {
+          next unless ref($event) eq 'HASH';
+          next if defined($event->{id}) && $seen_ids{$event->{id}}++;
+          push @events, $event;
+        }
+      }
+
+      return \@events;
+    }
+
+    my @events;
+    my %seen_ids;
+    for my $subscription_id (@{$subscription_ids}) {
+      my $subscription_events = $self->_read_nostr_subscription_snapshot($subscription_id);
+      for my $event (@{$subscription_events || []}) {
+        next unless ref($event) eq 'HASH';
+        next if defined($event->{id}) && $seen_ids{$event->{id}}++;
+        push @events, $event;
+      }
+    }
+    return \@events;
+  }
+
+  return $self->_read_authoritative_nip29_events_from_runtime($canonical);
+}
+
 sub _refresh_authoritative_nip29_channel_cache {
   my ($self, $channel, %args) = @_;
   return [] unless $self->_is_authoritative_channel($channel);
@@ -2104,23 +2247,14 @@ sub _refresh_authoritative_nip29_channel_cache {
   return [] unless defined $canonical;
 
   my $cache = ($self->{authoritative_channel_cache}{$canonical} ||= {});
-  my $events;
-
-  if ($self->_authority_relay_enabled) {
-    $events = eval {
-      Overnet::Core::Nostr->query_events(
-        relay_url => $self->_authority_relay_url,
-        filters   => [ $self->_authoritative_relay_filters_for_channel($canonical) ],
-      );
-    };
-    $events = [] if $@ || ref($events) ne 'ARRAY';
-  } else {
-    $events = $self->_read_authoritative_nip29_events_from_runtime($canonical);
-  }
-
-  $events = $self->_sort_authoritative_events($events);
+  my $events = $self->_load_authoritative_nip29_events(
+    $canonical,
+    (defined $args{refresh} ? (refresh => $args{refresh}) : ()),
+  );
+  my $view = $self->_derive_authoritative_channel_view_from_events($canonical, $events);
   $cache->{events} = $events;
-  $cache->{state} = $self->_derive_authoritative_channel_state_from_events($canonical, $events);
+  $cache->{view} = $view;
+  $cache->{state} = $self->_authoritative_channel_state_from_view($view);
   $cache->{refreshed_at} = time();
 
   return $events;
@@ -2134,20 +2268,12 @@ sub _read_authoritative_nip29_events {
   return [] unless defined $canonical;
 
   my $cache = $self->{authoritative_channel_cache}{$canonical};
-  my $refresh = $args{force} ? 1 : 0;
-  if ($self->_authority_relay_enabled && !$refresh) {
-    my $max_age = ($self->_authority_relay_poll_interval_ms || 250) / 1000;
-    $refresh = 1
-      if !$cache
-        || ref($cache->{events}) ne 'ARRAY'
-        || !defined($cache->{refreshed_at})
-        || (time() - $cache->{refreshed_at}) > $max_age;
-  }
-  if (!$self->_authority_relay_enabled && (!$cache || ref($cache->{events}) ne 'ARRAY')) {
-    $refresh = 1;
-  }
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
   if ($refresh) {
-    $self->_refresh_authoritative_nip29_channel_cache($canonical);
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
     $cache = $self->{authoritative_channel_cache}{$canonical};
   }
 
@@ -2156,63 +2282,139 @@ sub _read_authoritative_nip29_events {
     : [];
 }
 
-sub _derive_authoritative_channel_state_from_events {
-  my ($self, $channel, $authoritative_events) = @_;
+sub _derive_authoritative_channel_view_from_events {
+  my ($self, $channel, $authoritative_events, %args) = @_;
   return undef unless $self->_is_authoritative_channel($channel);
-  return undef unless ref($authoritative_events) eq 'ARRAY' && @{$authoritative_events};
+  return undef unless ref($authoritative_events) eq 'ARRAY';
 
   my $result = eval {
     $self->_request(
       method => 'adapters.derive',
       params => {
         adapter_session_id => $self->{adapter_session_id},
-        operation          => 'authoritative_channel_state',
+        operation          => 'authoritative_channel_view',
         input              => {
           network              => $self->{config}{network},
           target               => $self->_canonical_channel_name($channel),
           authoritative_events => $authoritative_events,
+          (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
         },
       },
     );
   };
   return undef if $@;
-  return undef unless ref($result->{state}) eq 'ARRAY' && @{$result->{state}};
-  return $result->{state}[0];
+  return undef unless ref($result->{view}) eq 'ARRAY' && @{$result->{view}};
+  return $result->{view}[0];
 }
 
-sub _derive_authoritative_channel_state {
+sub _authoritative_channel_state_from_view {
+  my ($self, $view) = @_;
+  return undef unless ref($view) eq 'HASH';
+
+  return {
+    operation         => 'authoritative_channel_state',
+    authority_profile => $view->{authority_profile},
+    object_type       => $view->{object_type},
+    object_id         => $view->{object_id},
+    group_host        => $view->{group_host},
+    group_id          => $view->{group_id},
+    group_ref         => $view->{group_ref},
+    channel_modes     => $view->{channel_modes},
+    supported_roles   => [ @{$view->{supported_roles} || []} ],
+    members           => [
+      map { +{
+        pubkey                => $_->{pubkey},
+        roles                 => [ @{$_->{roles} || []} ],
+        presentational_prefix => $_->{presentational_prefix},
+      } } @{$view->{members} || []}
+    ],
+  };
+}
+
+sub _derive_authoritative_channel_view {
   my ($self, $channel, %args) = @_;
   return undef unless $self->_is_authoritative_channel($channel);
   my $canonical = $self->_canonical_channel_name($channel);
   return undef unless defined $canonical;
-
-  if (!$self->_authority_relay_enabled) {
-    my $events = $self->_read_authoritative_nip29_events_from_runtime($canonical);
-    my $state = $self->_derive_authoritative_channel_state_from_events($canonical, $events);
-    $self->{authoritative_channel_cache}{$canonical} = {
-      events       => $events,
-      state        => $state,
-      refreshed_at => time(),
-    };
-    return $state;
-  }
-
   my $cache = $self->{authoritative_channel_cache}{$canonical};
-  my $refresh = $args{force} ? 1 : 0;
-  if (!$refresh) {
-    my $max_age = ($self->_authority_relay_poll_interval_ms || 250) / 1000;
-    $refresh = 1
-      if !$cache
-        || !exists($cache->{state})
-        || !defined($cache->{refreshed_at})
-        || (time() - $cache->{refreshed_at}) > $max_age;
-  }
+  my $refresh = $args{force} || !$cache || !exists($cache->{view});
   if ($refresh) {
-    $self->_refresh_authoritative_nip29_channel_cache($canonical);
+    my $old_view = $cache && ref($cache->{view}) eq 'HASH'
+      ? $cache->{view}
+      : undef;
+    my $old_events = $cache && ref($cache->{events}) eq 'ARRAY'
+      ? [ @{$cache->{events}} ]
+      : [];
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
     $cache = $self->{authoritative_channel_cache}{$canonical};
+    if ($args{reconcile_pending_invites} && $self->_authority_relay_enabled) {
+      $self->_reconcile_authoritative_pending_invites_from_refresh(
+        channel    => $canonical,
+        old_view   => $old_view,
+        old_events => $old_events,
+        new_view   => $cache->{view},
+        new_events => $cache->{events},
+      );
+    }
   }
 
-  return $cache->{state};
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_channel_view_from_events(
+    $canonical,
+    $cache->{events},
+    %args,
+  ) if defined $args{actor_pubkey};
+
+  return $cache->{view};
+}
+
+sub _derive_authoritative_channel_state {
+  my ($self, $channel, %args) = @_;
+  my $view = $self->_derive_authoritative_channel_view($channel, %args);
+  return $self->_authoritative_channel_state_from_view($view);
+}
+
+sub _sort_authoritative_events {
+  my ($self, $events) = @_;
+  my @decorated;
+  my $index = 0;
+  for my $event (@{$events || []}) {
+    push @decorated, [ $index++, $event ];
+  }
+  return [
+    map { $_->[1] } sort {
+      ((($a->[1]{created_at}) || 0) <=> (($b->[1]{created_at}) || 0))
+        || ($a->[0] <=> $b->[0])
+    } @decorated
+  ];
+}
+
+sub _read_authoritative_grant_events {
+  my ($self, %args) = @_;
+  return [] unless $self->_authority_relay_enabled;
+
+  my $cache = $self->{authoritative_grant_cache};
+  if (!$args{force} && $cache && ref($cache->{events}) eq 'ARRAY') {
+    return [ @{$cache->{events}} ];
+  }
+
+  my $subscription_id = $self->_ensure_authoritative_grant_subscription;
+  my $events = $self->_read_nostr_subscription_snapshot(
+    $subscription_id,
+    ($args{force} ? (refresh => 1) : ()),
+  );
+  $events = $self->_sort_authoritative_events($events);
+
+  $self->{authoritative_grant_cache} = {
+    events         => $events,
+    refreshed_at   => time(),
+    nick_by_pubkey => undef,
+  };
+
+  return [ @{$events} ];
 }
 
 sub _client_authoritative_pubkey {
@@ -2236,38 +2438,6 @@ sub _effective_authoritative_actor_pubkey_from_event {
       && !ref($event->{pubkey})
       && $event->{pubkey} =~ /\A[0-9a-f]{64}\z/;
   return undef;
-}
-
-sub _read_authoritative_grant_events {
-  my ($self, %args) = @_;
-  return [] unless $self->_authority_relay_enabled;
-
-  my $cache = $self->{authoritative_grant_cache};
-  if (!$args{force} && $cache && ref($cache->{events}) eq 'ARRAY') {
-    return [ @{$cache->{events}} ];
-  }
-
-  my $events = eval {
-    Overnet::Core::Nostr->query_events(
-      relay_url => $self->_authority_relay_url,
-      filters   => [
-        {
-          kinds => [ $self->_authority_grant_kind ],
-          limit => 200,
-        },
-      ],
-    );
-  };
-  $events = [] if $@ || ref($events) ne 'ARRAY';
-  $events = $self->_sort_authoritative_events($events);
-
-  $self->{authoritative_grant_cache} = {
-    events        => $events,
-    refreshed_at  => time(),
-    nick_by_pubkey => undef,
-  };
-
-  return [ @{$events} ];
 }
 
 sub _authoritative_grant_nick_map {
@@ -2342,7 +2512,7 @@ sub _authoritative_roles_for_client {
   my $pubkey = $self->_client_authoritative_pubkey($client);
   return () unless defined $pubkey;
 
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return () unless ref($state) eq 'HASH';
   my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
   return () unless ref($member) eq 'HASH';
@@ -2369,7 +2539,7 @@ sub _channel_mode_enabled {
 
 sub _channel_is_moderated_for_client {
   my ($self, $channel, $client) = @_;
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return 0 unless ref($state) eq 'HASH';
   return 0 unless $self->_channel_mode_enabled($state, 'm');
   return 0 if $self->_client_is_authoritative_operator($channel, $client);
@@ -2379,7 +2549,7 @@ sub _channel_is_moderated_for_client {
 
 sub _channel_is_topic_restricted_for_client {
   my ($self, $channel, $client) = @_;
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return 0 unless ref($state) eq 'HASH';
   return 0 unless $self->_channel_mode_enabled($state, 't');
   return 0 if $self->_client_is_authoritative_operator($channel, $client);
@@ -2395,117 +2565,53 @@ sub _authoritative_group_metadata_from_state {
   };
 }
 
-sub _authoritative_pending_invite_for_pubkey {
-  my ($self, $channel, $pubkey, %args) = @_;
-  return undef unless defined $pubkey && !ref($pubkey) && length($pubkey);
-
-  my (undef, $group_id) = $self->_authoritative_group_binding($channel);
-  return undef unless defined $group_id;
-
-  my %pending;
-  for my $event (@{$self->_read_authoritative_nip29_events($channel, %args)}) {
-    next unless ref($event) eq 'HASH';
-
-    my %tags = $self->_first_tag_values($event->{tags});
-    next unless defined $tags{h} && $tags{h} eq $group_id;
-
-    if (($event->{kind} || 0) == 9009) {
-      next unless defined $tags{code} && length($tags{code});
-      next if defined $tags{p} && $tags{p} ne $pubkey;
-
-      $pending{$tags{code}} = {
-        code => $tags{code},
-        (defined $tags{p} ? (target_pubkey => $tags{p}) : ()),
-      };
-      next;
-    }
-
-    if (($event->{kind} || 0) == 9021) {
-      next unless defined $tags{code} && length($tags{code});
-      next unless exists $pending{$tags{code}};
-      my $joiner_pubkey = $self->_effective_authoritative_actor_pubkey_from_event($event);
-      next unless defined $joiner_pubkey && $joiner_pubkey eq $pubkey;
-
-      delete $pending{$tags{code}};
-    }
-  }
-
-  return (values %pending)[0];
-}
-
 sub _authoritative_join_admission_for_client {
   my ($self, $channel, $client) = @_;
-  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  my $view = defined $pubkey
+    ? $self->_derive_authoritative_channel_view(
+        $channel,
+        force                     => 1,
+        actor_pubkey              => $pubkey,
+        reconcile_pending_invites => 1,
+      )
+    : $self->_derive_authoritative_channel_view($channel, force => 1);
   return {
     allowed => 0,
     reason  => '',
-  } unless ref($state) eq 'HASH';
+  } unless ref($view) eq 'HASH';
 
-  my $pubkey = $self->_client_authoritative_pubkey($client);
-  return {
-    allowed => 0,
-    reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
-  } unless defined $pubkey;
+  if (ref($view->{admission}) eq 'HASH') {
+    return {
+      allowed => $view->{admission}{allowed} ? 1 : 0,
+      (defined $view->{admission}{member} ? (member => $view->{admission}{member} ? 1 : 0) : ()),
+      (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
+      reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
+    };
+  }
 
-  my $member = $self->_authoritative_member_for_pubkey($state, $pubkey);
+  my $state = $self->_authoritative_channel_state_from_view($view);
   return {
-    allowed => 1,
-    member  => 1,
-  } if ref($member) eq 'HASH';
-
-  my $invite = $self->_authoritative_pending_invite_for_pubkey($channel, $pubkey, force => 1);
-  return {
-    allowed     => 1,
-    invite_code => $invite->{code},
-  } if ref($invite) eq 'HASH' && defined $invite->{code};
-
-  return {
-    allowed => 0,
+    allowed => $self->_channel_mode_enabled($state, 'i') ? 0 : 1,
     reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
   };
 }
 
-sub _authoritative_present_pubkeys_for_channel {
-  my ($self, $channel) = @_;
-  my %present;
-
-  for my $event (@{$self->_read_authoritative_nip29_events($channel)}) {
-    next unless ref($event) eq 'HASH';
-
-    if (($event->{kind} || 0) == 9021) {
-      my $pubkey = $self->_effective_authoritative_actor_pubkey_from_event($event);
-      next unless defined $pubkey;
-      $present{$pubkey} = 1;
-      next;
-    }
-
-    if (($event->{kind} || 0) == 9001) {
-      my %tags = $self->_first_tag_values($event->{tags});
-      next unless defined $tags{p};
-      delete $present{$tags{p}};
-      next;
-    }
-
-    if (($event->{kind} || 0) == 9022) {
-      my $pubkey = $self->_effective_authoritative_actor_pubkey_from_event($event);
-      next unless defined $pubkey;
-      delete $present{$pubkey};
-      next;
-    }
-  }
-
-  return \%present;
-}
-
 sub _authoritative_name_entries_for_channel {
-  my ($self, $client, $channel) = @_;
+  my ($self, $client, $channel, %args) = @_;
   return () unless ref($client) eq 'HASH';
 
-  my $state = $self->_derive_authoritative_channel_state($channel);
-  return () unless ref($state) eq 'HASH';
-  my $present = $self->_authoritative_present_pubkeys_for_channel($channel);
-  $present = {}
-    unless ref($present) eq 'HASH';
+  my $view = $self->_derive_authoritative_channel_view(
+    $channel,
+    ($args{force} ? (force => 1) : ()),
+  );
+  return () unless ref($view) eq 'HASH';
+  my $state = $self->_authoritative_channel_state_from_view($view);
+  my %present = map {
+    ($_->{pubkey} => $_)
+  } grep {
+    ref($_) eq 'HASH' && defined($_->{pubkey})
+  } @{$view->{present_members} || []};
 
   my $channel_key = $self->_channel_key($channel);
   return () unless defined $channel_key;
@@ -2538,7 +2644,7 @@ sub _authoritative_name_entries_for_channel {
   for my $member (@{$state->{members} || []}) {
     next unless ref($member) eq 'HASH';
     next unless defined $member->{pubkey};
-    next unless $present->{$member->{pubkey}};
+    next unless $present{$member->{pubkey}};
     my $nick = $self->_authoritative_nick_for_pubkey($member->{pubkey});
     next unless defined $nick && length($nick);
     next if $seen{$nick}++;
@@ -2625,7 +2731,7 @@ sub _handle_authoritative_mode_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -2700,7 +2806,7 @@ sub _handle_authoritative_kick_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -2765,7 +2871,7 @@ sub _handle_authoritative_invite_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_derive_authoritative_channel_state($channel);
+  my $state = $self->_derive_authoritative_channel_state($channel, force => 1);
   return $self->_send_chan_op_privs_needed($client_id, $channel)
     unless ref($state) eq 'HASH';
   return $self->_send_chan_op_privs_needed($client_id, $channel)
@@ -2899,7 +3005,7 @@ sub _emit_client_input {
     %{$input},
     network    => $self->{config}{network},
     nick       => $input->{nick} || $client->{nick},
-    created_at => int(time()),
+    created_at => $self->_next_authoritative_created_at($client),
   );
   if ($self->_authority_relay_enabled
       && $self->_is_authoritative_channel($payload{target})
@@ -2947,7 +3053,7 @@ sub _publish_authoritative_input {
     %{$input},
     network    => $self->{config}{network},
     nick       => $input->{nick} || $client->{nick},
-    created_at => int(time()),
+    created_at => $self->_next_authoritative_created_at($client),
   );
   if ($self->_authority_relay_enabled
       && $self->_is_authoritative_channel($payload{target})
@@ -3007,11 +3113,34 @@ sub _client_has_authoritative_delegation {
 sub _next_authoritative_delegate_sequence {
   my ($self, $client) = @_;
   return undef unless ref($client) eq 'HASH';
-  my $next = exists $client->{authority_delegate_sequence}
+  my $sequence_key = defined($client->{id}) && !ref($client->{id}) && length($client->{id})
+    ? $client->{id}
+    : undef;
+  my $next = defined($sequence_key) && exists($self->{authoritative_delegate_sequences}{$sequence_key})
+    ? $self->{authoritative_delegate_sequences}{$sequence_key}
+    : exists($client->{authority_delegate_sequence})
     ? $client->{authority_delegate_sequence}
     : 0;
   $next++;
   $client->{authority_delegate_sequence} = $next;
+  $self->{authoritative_delegate_sequences}{$sequence_key} = $next
+    if defined $sequence_key;
+  return $next;
+}
+
+sub _next_authoritative_created_at {
+  my ($self, $client) = @_;
+  my $now = int(time());
+  return $now unless ref($client) eq 'HASH';
+
+  my $key = defined($client->{id}) && !ref($client->{id}) && length($client->{id})
+    ? $client->{id}
+    : undef;
+  return $now unless defined $key;
+
+  my $last = $self->{authoritative_last_created_at}{$key} || 0;
+  my $next = $now > $last ? $now : $last + 1;
+  $self->{authoritative_last_created_at}{$key} = $next;
   return $next;
 }
 
@@ -3039,10 +3168,16 @@ sub _publish_authoritative_nip29_event {
       return 0;
     }
 
+    my $event_hash = ref($signed) eq 'HASH'
+      ? $signed
+      : $signed->to_hash;
     my $publish = eval {
-      Overnet::Core::Nostr->publish_event(
-        relay_url => $self->_authority_relay_url,
-        event     => $signed,
+      $self->_request(
+        method => 'nostr.publish_event',
+        params => {
+          relay_url => $self->_authority_relay_url,
+          event     => $event_hash,
+        },
       );
     };
     if ($@) {
@@ -3056,7 +3191,8 @@ sub _publish_authoritative_nip29_event {
       return 0;
     }
 
-    $self->_refresh_authoritative_nip29_channel_cache($channel);
+    $self->{suppress_subscription_event_ids}{$publish->{event_id}} = 1
+      if defined $publish->{event_id} && !ref($publish->{event_id}) && length($publish->{event_id});
     return 1;
   }
 
@@ -3145,84 +3281,51 @@ sub _handle_authoritative_mapped_result {
 
 sub _maybe_poll_authoritative_relay {
   my ($self) = @_;
-  return 0 unless $self->_authority_relay_enabled;
-  return 0 unless $self->_has_authoritative_relay_poll_interest;
-
-  my $interval_ms = $self->_authority_relay_poll_interval_ms || 250;
-  my $now = time();
-  return 0
-    if defined $self->{next_authority_relay_poll_at}
-      && $self->{next_authority_relay_poll_at} > $now;
-
-  $self->{next_authority_relay_poll_at} = $now + ($interval_ms / 1000);
-  $self->_read_authoritative_grant_events(force => 1);
-
-  for my $channel ($self->_authoritative_channels) {
-    my $canonical = $self->_canonical_channel_name($channel);
-    next unless defined $canonical;
-
-    my $cache = $self->{authoritative_channel_cache}{$canonical} || {};
-    my $old_events = ref($cache->{events}) eq 'ARRAY'
-      ? [ @{$cache->{events}} ]
-      : [];
-    my $old_state = $cache->{state};
-
-    my $new_events = $self->_refresh_authoritative_nip29_channel_cache($canonical);
-    my $new_state = $self->{authoritative_channel_cache}{$canonical}{state};
-    $self->_apply_authoritative_channel_cache_update(
-      channel   => $canonical,
-      old_events => $old_events,
-      new_events => $new_events,
-      old_state  => $old_state,
-      new_state  => $new_state,
-    );
-  }
-
   return 1;
 }
 
 sub _has_authoritative_relay_poll_interest {
   my ($self) = @_;
-
-  for my $client_id (keys %{$self->{clients}}) {
-    my $client = $self->{clients}{$client_id};
-    next unless ref($client) eq 'HASH';
-    return 1
-      if defined $client->{authority_delegate_event_id}
-        && !ref($client->{authority_delegate_event_id})
-        && length($client->{authority_delegate_event_id});
-  }
-
-  for my $channel_key (keys %{$self->{channels}}) {
-    my $state = $self->{channels}{$channel_key};
-    next unless ref($state) eq 'HASH';
-    next unless ref($state->{members}) eq 'HASH';
-    return 1 if keys %{$state->{members}};
-  }
-
   return 0;
 }
 
 sub _apply_authoritative_channel_cache_update {
   my ($self, %args) = @_;
   my $channel = $args{channel};
-  my $old_events = $args{old_events} || [];
-  my $new_events = $args{new_events} || [];
+  my $event = $args{event};
+  my $old_view = $args{old_view};
+  my $new_view = $args{new_view};
   my $old_state = $args{old_state};
   my $new_state = $args{new_state};
   return 0 unless $self->_is_authoritative_channel($channel);
+  return 0 unless ref($event) eq 'HASH';
 
-  my %old_ids = map { (($_->{id} || '') => 1) } @{$old_events};
-  my @new_only = grep {
-    ref($_) eq 'HASH'
-      && defined($_->{id})
-      && !$old_ids{$_->{id}}
-  } @{$new_events};
+  my %old_pending = map {
+    ($_->{code} => $_)
+  } grep {
+    ref($_) eq 'HASH' && defined($_->{code})
+  } @{ref($old_view) eq 'HASH' ? ($old_view->{pending_invites} || []) : []};
+  my %new_pending = map {
+    ($_->{code} => $_)
+  } grep {
+    ref($_) eq 'HASH' && defined($_->{code})
+  } @{ref($new_view) eq 'HASH' ? ($new_view->{pending_invites} || []) : []};
+  my %old_present = map {
+    ($_->{pubkey} => $_)
+  } grep {
+    ref($_) eq 'HASH' && defined($_->{pubkey})
+  } @{ref($old_view) eq 'HASH' ? ($old_view->{present_members} || []) : []};
+  my %new_present = map {
+    ($_->{pubkey} => $_)
+  } grep {
+    ref($_) eq 'HASH' && defined($_->{pubkey})
+  } @{ref($new_view) eq 'HASH' ? ($new_view->{present_members} || []) : []};
 
-  for my $event (@new_only) {
-    next unless ($event->{kind} || 0) == 9009;
+  if (($event->{kind} || 0) == 9009) {
     my %tags = $self->_first_tag_values($event->{tags});
-    next unless defined $tags{code} && length($tags{code});
+    return 1 unless defined $tags{code} && length($tags{code});
+    return 1 if exists $old_pending{$tags{code}};
+    return 1 unless exists $new_pending{$tags{code}};
 
     my $actor_pubkey = $self->_effective_authoritative_actor_pubkey_from_event($event);
     my $actor_nick = $self->_authoritative_nick_for_pubkey($actor_pubkey)
@@ -3241,18 +3344,8 @@ sub _apply_authoritative_channel_cache_update {
         sprintf(':%s INVITE %s :%s', $actor_nick, $client->{nick}, $channel),
       );
     }
+    return 1;
   }
-
-  my %old_members = map {
-    ($_->{pubkey} => 1)
-  } grep {
-    ref($_) eq 'HASH' && defined($_->{pubkey})
-  } @{ref($old_state) eq 'HASH' ? ($old_state->{members} || []) : []};
-  my %new_members = map {
-    ($_->{pubkey} => 1)
-  } grep {
-    ref($_) eq 'HASH' && defined($_->{pubkey})
-  } @{ref($new_state) eq 'HASH' ? ($new_state->{members} || []) : []};
 
   my $channel_key = $self->_channel_key($channel);
   return 1 unless defined $channel_key;
@@ -3262,8 +3355,8 @@ sub _apply_authoritative_channel_cache_update {
   my %removed_pubkeys = map {
     ($_ => 1)
   } grep {
-    $old_members{$_} && !$new_members{$_}
-  } keys %old_members;
+    $old_present{$_} && !$new_present{$_}
+  } keys %old_present;
 
   for my $pubkey (sort keys %removed_pubkeys) {
     my @affected_client_ids = grep {
@@ -3272,22 +3365,18 @@ sub _apply_authoritative_channel_cache_update {
         && (($self->_client_authoritative_pubkey($client) || '') eq $pubkey)
     } sort keys %{$channel_state->{members} || {}};
 
-    my ($kick_event) = grep {
-      my %tags = $self->_first_tag_values($_->{tags});
-      (($_->{kind} || 0) == 9001)
-        && defined($tags{p})
-        && $tags{p} eq $pubkey;
-    } reverse @new_only;
-    if (ref($kick_event) eq 'HASH') {
+    if (($event->{kind} || 0) == 9001) {
+      my %tags = $self->_first_tag_values($event->{tags});
+      next unless defined($tags{p}) && $tags{p} eq $pubkey;
       my $target_nick = @affected_client_ids
         ? $self->{clients}{$affected_client_ids[0]}{nick}
         : $self->_authoritative_nick_for_pubkey($pubkey);
       next unless defined $target_nick && length $target_nick;
 
       my $actor_nick = $self->_authoritative_nick_for_pubkey(
-        $self->_effective_authoritative_actor_pubkey_from_event($kick_event)
+        $self->_effective_authoritative_actor_pubkey_from_event($event)
       ) || $self->{config}{server_name};
-      my $reason = $kick_event->{content};
+      my $reason = $event->{content};
       my $line = sprintf(':%s KICK %s %s', $actor_nick, $channel, $target_nick);
       $line .= ' :' . $reason
         if defined $reason && !ref($reason) && length($reason);
@@ -3304,16 +3393,13 @@ sub _apply_authoritative_channel_cache_update {
       next;
     }
 
-    my ($leave_event) = grep {
-      (($_->{kind} || 0) == 9022)
-        && (($self->_effective_authoritative_actor_pubkey_from_event($_) || '') eq $pubkey);
-    } reverse @new_only;
-    next unless ref($leave_event) eq 'HASH';
+    next unless ($event->{kind} || 0) == 9022;
+    next unless (($self->_effective_authoritative_actor_pubkey_from_event($event) || '') eq $pubkey);
 
     my $actor_nick = @affected_client_ids
       ? $self->{clients}{$affected_client_ids[0]}{nick}
       : ($self->_authoritative_nick_for_pubkey($pubkey) || $self->{config}{server_name});
-    my $reason = $leave_event->{content};
+    my $reason = $event->{content};
     my $line = sprintf(':%s PART %s', $actor_nick, $channel);
     $line .= ' :' . $reason
       if defined $reason && !ref($reason) && length($reason);
@@ -3332,6 +3418,43 @@ sub _apply_authoritative_channel_cache_update {
   }
 
   return 1;
+}
+
+sub _reconcile_authoritative_pending_invites_from_refresh {
+  my ($self, %args) = @_;
+  my $channel = $args{channel};
+  my $old_view = $args{old_view};
+  my $old_events = $args{old_events};
+  my $new_view = $args{new_view};
+  my $new_events = $args{new_events};
+  return 0 unless $self->_is_authoritative_channel($channel);
+  return 0 unless ref($new_view) eq 'HASH';
+  return 0 unless ref($old_events) eq 'ARRAY' && ref($new_events) eq 'ARRAY';
+
+  my %old_ids = map {
+    (defined($_->{id}) && !ref($_->{id}) && length($_->{id}))
+      ? ($_->{id} => 1)
+      : ()
+  } grep { ref($_) eq 'HASH' } @{$old_events};
+
+  my $count = 0;
+  for my $event (@{$new_events}) {
+    next unless ref($event) eq 'HASH';
+    next unless ($event->{kind} || 0) == 9009;
+    next unless defined($event->{id}) && !ref($event->{id}) && length($event->{id});
+    next if $old_ids{$event->{id}};
+
+    $count += $self->_apply_authoritative_channel_cache_update(
+      channel   => $channel,
+      event     => $event,
+      old_view  => $old_view,
+      new_view  => $new_view,
+      old_state => $self->_authoritative_channel_state_from_view($old_view),
+      new_state => $self->_authoritative_channel_state_from_view($new_view),
+    ) || 0;
+  }
+
+  return $count;
 }
 
 sub _userhost_entry_for_nick {
@@ -3651,6 +3774,8 @@ sub _disconnect_client {
 
   close $client->{socket}
     if defined $client->{socket};
+  delete $self->{authoritative_last_created_at}{$client_id};
+  delete $self->{authoritative_delegate_sequences}{$client_id};
   delete $self->{clients}{$client_id};
 
   return 1;
@@ -3659,6 +3784,9 @@ sub _disconnect_client {
 sub _handle_subscription_event {
   my ($self, $params) = @_;
   return 0 unless ref($params) eq 'HASH';
+  if (($params->{item_type} || '') eq 'nostr.event') {
+    return $self->_handle_nostr_subscription_event($params);
+  }
   return 0 unless ($params->{item_type} || '') eq 'event'
     || ($params->{item_type} || '') eq 'state'
     || ($params->{item_type} || '') eq 'private_message';
@@ -3680,6 +3808,65 @@ sub _handle_subscription_event {
   }
 
   return scalar @{$render->{client_ids}};
+}
+
+sub _handle_nostr_subscription_event {
+  my ($self, $params) = @_;
+  return 0 unless ref($params->{data}) eq 'HASH';
+
+  my $subscription_id = $params->{subscription_id};
+  return 0 unless defined $subscription_id && !ref($subscription_id) && length($subscription_id);
+
+  if (defined $params->{data}{id} && delete $self->{suppress_subscription_event_ids}{$params->{data}{id}}) {
+    return 0;
+  }
+
+  if (($subscription_id || '') eq ($self->{authoritative_grant_subscription_id} || '')) {
+    $self->_read_authoritative_grant_events(force => 1);
+    return 1;
+  }
+
+  my $channel = $self->{authoritative_subscription_channels}{$subscription_id};
+  return 0 unless defined $channel;
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return 0 unless defined $canonical;
+
+  my $cache = $self->{authoritative_channel_cache}{$canonical} || {};
+  my $old_view = $cache->{view};
+  my $old_state = $cache->{state};
+  my $event_id = defined($params->{data}{id}) && !ref($params->{data}{id}) && length($params->{data}{id})
+    ? $params->{data}{id}
+    : undef;
+  my $new_cache;
+  if (ref($cache->{events}) eq 'ARRAY') {
+    my @events = @{$cache->{events}};
+    if (!defined($event_id) || !grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $event_id } @events) {
+      push @events, $params->{data};
+    }
+    my $sorted_events = $self->_sort_authoritative_events(\@events);
+    my $new_view = $self->_derive_authoritative_channel_view_from_events($canonical, $sorted_events);
+    $new_cache = $self->{authoritative_channel_cache}{$canonical} = {
+      %{$cache},
+      events       => $sorted_events,
+      view         => $new_view,
+      state        => $self->_authoritative_channel_state_from_view($new_view),
+      refreshed_at => time(),
+    };
+  } else {
+    $self->_refresh_authoritative_nip29_channel_cache($canonical);
+    $new_cache = $self->{authoritative_channel_cache}{$canonical} || {};
+  }
+  $self->_apply_authoritative_channel_cache_update(
+    channel   => $canonical,
+    event     => $params->{data},
+    old_view  => $old_view,
+    new_view  => $new_cache->{view},
+    old_state => $old_state,
+    new_state => $new_cache->{state},
+  );
+
+  return 1;
 }
 
 sub _render_subscription_item {
@@ -4152,11 +4339,19 @@ sub _request {
   my ($self, %args) = @_;
   my $method = $args{method};
   my $params = $args{params} || {};
+  my @deferred_messages;
 
   die "method is required\n"
     unless defined $method && !ref($method) && length($method);
   die "params must be an object\n"
     unless ref($params) eq 'HASH';
+
+  my $restore_deferred = sub {
+    return unless @deferred_messages;
+    unshift @{$self->{pending_messages}}, @deferred_messages;
+    @deferred_messages = ();
+    return;
+  };
 
   my $id = 'program-' . $self->{next_request_id}++;
   $self->_send_message(
@@ -4173,6 +4368,7 @@ sub _request {
       : $self->_next_runtime_message;
 
     if (($message->{type} || '') eq 'response') {
+      $restore_deferred->();
       die "Unexpected response id while awaiting $method\n"
         unless ($message->{id} || '') eq $id;
 
@@ -4185,19 +4381,22 @@ sub _request {
     }
 
     if (($message->{type} || '') eq 'request' && ($message->{method} || '') eq 'runtime.shutdown') {
+      $restore_deferred->();
       $self->_handle_runtime_shutdown($message);
       die '__shutdown__';
     }
 
     if (($message->{type} || '') eq 'notification' && ($message->{method} || '') eq 'runtime.fatal') {
+      $restore_deferred->();
       die "runtime fatal: " . ($message->{params}{code} || 'unknown');
     }
 
     if (($message->{type} || '') eq 'notification' && ($message->{method} || '') eq 'runtime.subscription_event') {
-      $self->_handle_subscription_event($message->{params} || {});
+      push @deferred_messages, $message;
       next;
     }
 
+    $restore_deferred->();
     die "Unexpected message while awaiting response for $method\n";
   }
 }
@@ -4217,10 +4416,12 @@ sub _read_runtime_chunk {
 }
 
 sub _drain_pending_runtime_messages {
-  my ($self) = @_;
+  my ($self, %args) = @_;
+  my $max_messages = $args{max_messages};
   my $count = 0;
 
   while (@{$self->{pending_messages}}) {
+    last if defined $max_messages && $count >= $max_messages;
     my $message = shift @{$self->{pending_messages}};
     $count++;
 
@@ -4487,9 +4688,15 @@ sub _send_names_list {
 
   my @nicks;
   if ($self->_is_authoritative_channel($display_channel)) {
-    $self->_refresh_authoritative_nip29_channel_cache($display_channel)
-      if $opts{force};
-    @nicks = $self->_authoritative_name_entries_for_channel($client, $display_channel);
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $display_channel,
+      ($opts{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    ) if $opts{force};
+    @nicks = $self->_authoritative_name_entries_for_channel(
+      $client,
+      $display_channel,
+      force => $opts{force} ? 1 : 0,
+    );
   }
 
   if (!@nicks) {
@@ -4690,6 +4897,8 @@ sub _close_all_clients {
   }
   $self->{channels} = {};
   $self->{nick_to_client_id} = {};
+  $self->{authoritative_last_created_at} = {};
+  $self->{authoritative_delegate_sequences} = {};
   return 1;
 }
 
