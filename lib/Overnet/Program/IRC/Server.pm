@@ -1029,11 +1029,22 @@ sub _handle_client_line {
     }
 
     my $channel = $self->_canonical_channel_name($channel_input);
-    return 1 if defined $self->_client_joined_channel_name($client, $channel_input);
+    my $already_joined = $self->_client_joined_channel_name($client, $channel_input);
     my $authoritative_join;
 
     if ($self->_is_authoritative_channel($channel)) {
       $authoritative_join = $self->_authoritative_join_admission_for_client($channel, $client);
+      if (defined $already_joined) {
+        if ($authoritative_join->{allowed} && $authoritative_join->{present}) {
+          return 1;
+        }
+        $self->_remove_client_from_channel(
+          $client_id,
+          $channel,
+          nick => $client->{nick},
+        );
+        $already_joined = undef;
+      }
       unless ($authoritative_join->{allowed}) {
         if ($authoritative_join->{auth_required}) {
           $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH is required for authoritative JOIN');
@@ -1100,6 +1111,9 @@ sub _handle_client_line {
           );
         }
       }
+    }
+    elsif (defined $already_joined) {
+      return 1;
     }
 
     $self->_add_client_to_channel($client_id, $channel);
@@ -2913,6 +2927,32 @@ sub _derive_authoritative_channel_view_from_events {
   return $result->{view}[0];
 }
 
+sub _derive_authoritative_join_admission_from_events {
+  my ($self, $channel, $authoritative_events, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  return undef unless ref($authoritative_events) eq 'ARRAY';
+
+  my $result = eval {
+    $self->_request(
+      method => 'adapters.derive',
+      params => {
+        adapter_session_id => $self->{adapter_session_id},
+        operation          => 'authoritative_join_admission',
+        input              => {
+          network              => $self->{config}{network},
+          target               => $self->_canonical_channel_name($channel),
+          authoritative_events => $authoritative_events,
+          (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
+          (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
+        },
+      },
+    );
+  };
+  return undef if $@;
+  return undef unless ref($result->{admission}) eq 'ARRAY' && @{$result->{admission}};
+  return $result->{admission}[0];
+}
+
 sub _authoritative_channel_state_from_view {
   my ($self, $view) = @_;
   return undef unless ref($view) eq 'HASH';
@@ -2988,6 +3028,58 @@ sub _derive_authoritative_channel_view {
   ) if defined $args{actor_pubkey};
 
   return $cache->{view};
+}
+
+sub _derive_authoritative_join_admission {
+  my ($self, $channel, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    my $old_view = $cache && ref($cache->{view}) eq 'HASH'
+      ? $cache->{view}
+      : undef;
+    my $old_events = $cache && ref($cache->{events}) eq 'ARRAY'
+      ? [ @{$cache->{events}} ]
+      : [];
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+    if ($args{reconcile_pending_invites} && $self->_authority_relay_enabled) {
+      $self->_reconcile_authoritative_pending_invites_from_refresh(
+        channel    => $canonical,
+        old_view   => $old_view,
+        old_events => $old_events,
+        new_view   => $cache->{view},
+        new_events => $cache->{events},
+      );
+    }
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_join_admission_from_events(
+    $canonical,
+    $cache->{events},
+    %args,
+  );
+}
+
+sub _authoritative_join_admission_is_populated {
+  my ($self, $admission) = @_;
+  return 0 unless ref($admission) eq 'HASH';
+  return 1 if exists $admission->{allowed};
+  return 1 if exists $admission->{member};
+  return 1 if exists $admission->{present};
+  return 1 if exists $admission->{invite_code};
+  return 1 if exists $admission->{deleted};
+  return 1 if exists $admission->{create_channel};
+  return 1 if exists $admission->{auth_required};
+  return 1 if exists $admission->{reason};
+  return 0;
 }
 
 sub _derive_authoritative_channel_state {
@@ -3349,62 +3441,112 @@ sub _authoritative_join_admission_for_client {
     };
   }
 
-  my $view = defined $pubkey
-    ? $self->_derive_authoritative_channel_view(
+  my $admission = defined $pubkey
+    ? $self->_derive_authoritative_join_admission(
         $channel,
         actor_pubkey              => $pubkey,
         actor_mask                => $actor_mask,
         reconcile_pending_invites => 1,
       )
-    : $self->_derive_authoritative_channel_view($channel);
-  if (ref($view) ne 'HASH') {
-    $view = defined $pubkey
-      ? $self->_derive_authoritative_channel_view(
+    : $self->_derive_authoritative_join_admission($channel);
+  if (!$self->_authoritative_join_admission_is_populated($admission)) {
+    $admission = defined $pubkey
+      ? $self->_derive_authoritative_join_admission(
           $channel,
           force                     => 1,
           actor_pubkey              => $pubkey,
           actor_mask                => $actor_mask,
           reconcile_pending_invites => 1,
         )
-      : $self->_derive_authoritative_channel_view($channel, force => 1);
+      : $self->_derive_authoritative_join_admission($channel, force => 1);
   }
   return {
     allowed => 0,
     auth_required => $pubkey ? 0 : 1,
     reason  => '',
-  } unless ref($view) eq 'HASH';
+  } unless $self->_authoritative_join_admission_is_populated($admission) || ref(
+      $admission = (
+        defined $pubkey
+          ? do {
+              my $view = $self->_derive_authoritative_channel_view(
+                $channel,
+                actor_pubkey              => $pubkey,
+                actor_mask                => $actor_mask,
+                reconcile_pending_invites => 1,
+              );
+              if (ref($view) ne 'HASH') {
+                $view = $self->_derive_authoritative_channel_view(
+                  $channel,
+                  force                     => 1,
+                  actor_pubkey              => $pubkey,
+                  actor_mask                => $actor_mask,
+                  reconcile_pending_invites => 1,
+                );
+              }
+              if (ref($view) eq 'HASH' && ref($view->{admission}) eq 'HASH') {
+                my $present = scalar grep {
+                  ref($_) eq 'HASH'
+                    && defined($_->{pubkey})
+                    && $_->{pubkey} eq $pubkey
+                } @{$view->{present_members} || []};
+                +{
+                  allowed => $view->{admission}{allowed} ? 1 : 0,
+                  (defined $view->{admission}{member} ? (member => $view->{admission}{member} ? 1 : 0) : ()),
+                  present => $present ? 1 : 0,
+                  (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
+                  (defined $view->{admission}{deleted} ? (deleted => $view->{admission}{deleted} ? 1 : 0) : ()),
+                  reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
+                };
+              } elsif (ref($view) eq 'HASH' && $view->{tombstoned}) {
+                +{
+                  allowed => 0,
+                  deleted => 1,
+                  reason  => 'deleted',
+                };
+              } elsif (ref($view) eq 'HASH') {
+                my $state = $self->_authoritative_channel_state_from_view($view);
+                +{
+                  allowed => $self->_channel_mode_enabled($state, 'i') ? 0 : 1,
+                  present => 0,
+                  reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
+                };
+              } else {
+                undef;
+              }
+            }
+          : do {
+              my $view = $self->_derive_authoritative_channel_view($channel);
+              $view = $self->_derive_authoritative_channel_view($channel, force => 1)
+                unless ref($view) eq 'HASH';
+              if (ref($view) eq 'HASH' && $view->{tombstoned}) {
+                +{
+                  allowed => 0,
+                  deleted => 1,
+                  reason  => 'deleted',
+                };
+              } elsif (ref($view) eq 'HASH') {
+                my $state = $self->_authoritative_channel_state_from_view($view);
+                +{
+                  allowed => $self->_channel_mode_enabled($state, 'i') ? 0 : 1,
+                  present => 0,
+                  reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
+                };
+              } else {
+                undef;
+              }
+            }
+      )
+    ) eq 'HASH';
 
-  if (ref($view->{admission}) eq 'HASH') {
-    my $present = defined $pubkey
-      ? scalar grep {
-          ref($_) eq 'HASH'
-            && defined($_->{pubkey})
-            && $_->{pubkey} eq $pubkey
-        } @{$view->{present_members} || []}
-      : 0;
-    return {
-      allowed => $view->{admission}{allowed} ? 1 : 0,
-      (defined $view->{admission}{member} ? (member => $view->{admission}{member} ? 1 : 0) : ()),
-      present => $present ? 1 : 0,
-      (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
-      (defined $view->{admission}{deleted} ? (deleted => $view->{admission}{deleted} ? 1 : 0) : ()),
-      reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
-    };
-  }
-
-  if ($view->{tombstoned}) {
-    return {
-      allowed => 0,
-      deleted => 1,
-      reason  => 'deleted',
-    };
-  }
-
-  my $state = $self->_authoritative_channel_state_from_view($view);
   return {
-    allowed => $self->_channel_mode_enabled($state, 'i') ? 0 : 1,
-    present => 0,
-    reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
+    allowed => $admission->{allowed} ? 1 : 0,
+    (defined $admission->{member} ? (member => $admission->{member} ? 1 : 0) : ()),
+    (defined $admission->{present} ? (present => $admission->{present} ? 1 : 0) : ()),
+    (defined $admission->{invite_code} ? (invite_code => $admission->{invite_code}) : ()),
+    (defined $admission->{deleted} ? (deleted => $admission->{deleted} ? 1 : 0) : ()),
+    (defined $admission->{create_channel} ? (create_channel => $admission->{create_channel} ? 1 : 0) : ()),
+    (defined $admission->{auth_required} ? (auth_required => $admission->{auth_required} ? 1 : 0) : ()),
+    reason  => defined $admission->{reason} ? $admission->{reason} : '',
   };
 }
 
@@ -3412,10 +3554,12 @@ sub _authoritative_name_entries_for_channel {
   my ($self, $client, $channel, %args) = @_;
   return () unless ref($client) eq 'HASH';
 
-  my $view = $self->_derive_authoritative_channel_view(
-    $channel,
-    ($args{force} ? (force => 1) : ()),
-  );
+  my $view = ref($args{view}) eq 'HASH'
+    ? $args{view}
+    : $self->_derive_authoritative_channel_view(
+        $channel,
+        ($args{force} ? (force => 1) : ()),
+      );
   return () unless ref($view) eq 'HASH';
   my $state = $self->_authoritative_channel_state_from_view($view);
   my %present = map {
@@ -5848,11 +5992,12 @@ sub _send_names_list {
     $self->_refresh_authoritative_nip29_channel_cache(
       $display_channel,
       ($opts{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
-    ) if $opts{force};
+    ) if $opts{force} && ref($opts{view}) ne 'HASH';
     @nicks = $self->_authoritative_name_entries_for_channel(
       $client,
       $display_channel,
       force => $opts{force} ? 1 : 0,
+      (ref($opts{view}) eq 'HASH' ? (view => $opts{view}) : ()),
     );
   }
 
@@ -5895,14 +6040,24 @@ sub _send_names_list {
 sub _send_join_bootstrap {
   my ($self, $client_id, $channel) = @_;
   if ($self->_is_authoritative_channel($channel)) {
-    my $view = $self->_derive_authoritative_channel_view($channel);
+    my $canonical = $self->_canonical_channel_name($channel);
+    my $cache = defined $canonical
+      ? $self->{authoritative_channel_cache}{$canonical}
+      : undef;
+    my $view = ref($cache) eq 'HASH' && ref($cache->{view}) eq 'HASH'
+      ? $cache->{view}
+      : $self->_derive_authoritative_channel_view($channel);
     $view = $self->_derive_authoritative_channel_view($channel, force => 1)
       unless ref($view) eq 'HASH';
     $self->_sync_authoritative_topic_state_from_view($channel, $view);
     my $line = $self->_authoritative_topic_line_from_view($channel, $view);
     $self->_send_client_line($client_id, $line)
       if defined $line && length $line;
-    return $self->_send_names_list($client_id, $channel);
+    return $self->_send_names_list(
+      $client_id,
+      $channel,
+      (ref($view) eq 'HASH' ? (view => $view) : ()),
+    );
   }
 
   my $channel_key = $self->_channel_key($channel);
