@@ -806,6 +806,36 @@ sub _handle_client_line {
     return 1;
   }
 
+  if ($command eq 'OVERNETCHANNEL') {
+    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
+      $self->_send_need_more_params($client_id, 'OVERNETCHANNEL');
+      return 1;
+    }
+
+    my $subcommand = uc($params[0]);
+    if ($subcommand eq 'DELETE') {
+      my $channel_input = $params[1];
+      unless ($self->_is_channel_name($channel_input)) {
+        $self->_send_no_such_channel($client_id, $channel_input);
+        return 1;
+      }
+
+      my $channel = $self->_canonical_channel_name($channel_input);
+      unless ($self->_is_authoritative_channel($channel)) {
+        $self->_send_no_such_channel($client_id, $channel_input);
+        return 1;
+      }
+
+      return $self->_handle_authoritative_delete_command(
+        client_id => $client_id,
+        channel   => $channel,
+      );
+    }
+
+    $self->_send_unknown_command($client_id, 'OVERNETCHANNEL');
+    return 1;
+  }
+
   if ($command eq 'USERHOST') {
     if (!@params) {
       $self->_send_need_more_params($client_id, 'USERHOST');
@@ -988,6 +1018,10 @@ sub _handle_client_line {
       unless ($authoritative_join->{allowed}) {
         if ($authoritative_join->{auth_required}) {
           $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH is required for authoritative JOIN');
+          return 1;
+        }
+        if ($authoritative_join->{deleted}) {
+          $self->_send_no_such_channel($client_id, $channel);
           return 1;
         }
         $self->_send_cannot_join_channel(
@@ -1640,7 +1674,7 @@ sub _accept_authoritative_delegate_event {
 
 sub _command_requires_registration {
   my ($self, $command) = @_;
-  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK INVITE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH);
+  return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK INVITE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH OVERNETCHANNEL);
 }
 
 sub _send_unknown_command {
@@ -2513,8 +2547,8 @@ sub _ensure_authoritative_discovery_subscription {
       timeout_ms      => $self->_authority_relay_query_timeout_ms,
       filters         => [
         {
-          kinds => [39000],
-          limit => 500,
+          kinds => [ 39000, 9002 ],
+          limit => 1_000,
         },
       ],
     },
@@ -2614,6 +2648,15 @@ sub _remember_authoritative_discovered_channel {
   return 1;
 }
 
+sub _forget_authoritative_discovered_channel {
+  my ($self, $channel) = @_;
+  my $canonical = $self->_canonical_channel_name($channel);
+  return 0 unless defined $canonical;
+
+  delete $self->{authoritative_discovered_channels}{$canonical};
+  return 1;
+}
+
 sub _record_authoritative_discovery_event {
   my ($self, $event) = @_;
   return 0 unless ref($event) eq 'HASH';
@@ -2625,6 +2668,9 @@ sub _record_authoritative_discovery_event {
 
   my %tags = $self->_first_tag_values($event->{tags});
   my $group_id = $tags{d} || $tags{h};
+  if (Overnet::Authority::HostedChannel::group_event_is_tombstoned(event => $event)) {
+    return $self->_forget_authoritative_discovered_channel($channel);
+  }
   return $self->_remember_authoritative_discovered_channel(
     channel  => $channel,
     group_id => $group_id,
@@ -2643,6 +2689,7 @@ sub _refresh_authoritative_discovery_cache {
     $subscription_id,
     ($args{refresh} ? (refresh => 1) : ()),
   );
+  $events = $self->_sort_authoritative_events($events);
   my $count = 0;
   for my $event (@{$events || []}) {
     $count += $self->_record_authoritative_discovery_event($event) || 0;
@@ -2845,6 +2892,7 @@ sub _authoritative_channel_state_from_view {
     (ref($view->{ban_masks}) eq 'ARRAY' ? (ban_masks => [ @{$view->{ban_masks}} ]) : ()),
     (exists $view->{topic} ? (topic => $view->{topic}) : ()),
     (exists $view->{topic_actor_pubkey} ? (topic_actor_pubkey => $view->{topic_actor_pubkey}) : ()),
+    ($view->{tombstoned} ? (tombstoned => 1) : ()),
     supported_roles   => [ @{$view->{supported_roles} || []} ],
     members           => [
       map { +{
@@ -3095,6 +3143,7 @@ sub _authoritative_group_metadata_from_state {
     moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
     topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
     ban_masks        => ref($state->{ban_masks}) eq 'ARRAY' ? [ @{$state->{ban_masks}} ] : [],
+    tombstoned       => $state->{tombstoned} ? 1 : 0,
     (exists($state->{topic}) ? (topic => $state->{topic}) : ()),
   };
 }
@@ -3140,6 +3189,16 @@ sub _sync_authoritative_topic_state_from_view {
   my $display_channel = $self->_canonical_channel_name($channel);
   return 0 unless defined $display_channel;
 
+  my $channel_key = $self->_channel_key($display_channel);
+  return 0 unless defined $channel_key;
+  if (ref($view) eq 'HASH' && $view->{tombstoned}) {
+    if (exists $self->{channels}{$channel_key}) {
+      $self->{channels}{$channel_key}{topic_text} = undef;
+      $self->{channels}{$channel_key}{topic_line} = undef;
+    }
+    return 1;
+  }
+
   my $state = $self->_channel_state($display_channel);
   if (ref($view) eq 'HASH' && exists $view->{topic}) {
     $state->{topic_text} = $view->{topic};
@@ -3147,6 +3206,50 @@ sub _sync_authoritative_topic_state_from_view {
   } else {
     $state->{topic_text} = undef;
     $state->{topic_line} = undef;
+  }
+
+  return 1;
+}
+
+sub _apply_authoritative_channel_tombstone {
+  my ($self, $channel, %args) = @_;
+  my $display_channel = $self->_canonical_channel_name($channel);
+  return 0 unless defined $display_channel;
+
+  my $reason = defined($args{reason}) && !ref($args{reason}) && length($args{reason})
+    ? $args{reason}
+    : 'channel deleted';
+  my $channel_key = $self->_channel_key($display_channel);
+  return 0 unless defined $channel_key;
+
+  $self->_forget_authoritative_discovered_channel($display_channel);
+
+  my $state = $self->{channels}{$channel_key};
+  unless (ref($state) eq 'HASH') {
+    $self->_close_channel_subscription($display_channel);
+    return 1;
+  }
+
+  my @client_ids = grep { exists $self->{clients}{$_} } sort keys %{$state->{members} || {}};
+  for my $client_id (@client_ids) {
+    my $client = $self->{clients}{$client_id};
+    next unless ref($client) eq 'HASH';
+    my $nick = defined $client->{nick} && !ref($client->{nick}) && length($client->{nick})
+      ? $client->{nick}
+      : $self->{config}{server_name};
+    my $line = sprintf(':%s PART %s', $nick, $display_channel);
+    $line .= ' :' . $reason;
+    $self->_broadcast_channel_line($display_channel, $line);
+    $self->_remove_client_from_channel(
+      $client_id,
+      $display_channel,
+      nick => $nick,
+    );
+  }
+
+  if (exists $self->{channels}{$channel_key}) {
+    $self->_close_channel_subscription($display_channel);
+    delete $self->{channels}{$channel_key};
   }
 
   return 1;
@@ -3198,7 +3301,16 @@ sub _authoritative_join_admission_for_client {
       allowed => $view->{admission}{allowed} ? 1 : 0,
       (defined $view->{admission}{member} ? (member => $view->{admission}{member} ? 1 : 0) : ()),
       (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
+      (defined $view->{admission}{deleted} ? (deleted => $view->{admission}{deleted} ? 1 : 0) : ()),
       reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
+    };
+  }
+
+  if ($view->{tombstoned}) {
+    return {
+      allowed => 0,
+      deleted => 1,
+      reason  => 'deleted',
     };
   }
 
@@ -3384,6 +3496,53 @@ sub _handle_authoritative_topic_command {
     $self->_channel_state($channel)->{topic_text} = $text;
     $self->_channel_state($channel)->{topic_line} = $line;
   }
+  return 1;
+}
+
+sub _handle_authoritative_delete_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return $self->_send_no_such_channel($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_no_such_channel($client_id, $channel)
+    if $state->{tombstoned};
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
+    $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative channel deletion');
+    return 1;
+  }
+
+  my %input = (
+    command        => 'DELETE',
+    target         => $channel,
+    actor_pubkey   => $actor_pubkey,
+    group_metadata => $self->_authoritative_group_metadata_from_state($state),
+  );
+  if ($self->_authority_relay_enabled) {
+    unless ($self->_publish_authoritative_input($client, \%input)) {
+      $self->_send_server_notice(
+        $client_id,
+        $self->{authoritative_publish_error} || 'authoritative relay publish failed',
+      );
+      return 1;
+    }
+  } else {
+    return 1 unless $self->_emit_client_input($client, \%input);
+    $self->_refresh_authoritative_nip29_channel_cache($channel);
+  }
+
+  $self->_send_server_notice($client_id, "OVERNETCHANNEL DELETE $channel");
   return 1;
 }
 
@@ -4015,6 +4174,16 @@ sub _apply_authoritative_channel_cache_update {
   my $new_topic_actor = ref($new_view) eq 'HASH' && exists $new_view->{topic_actor_pubkey}
     ? $new_view->{topic_actor_pubkey}
     : undef;
+  my $old_tombstoned = ref($old_view) eq 'HASH' && $old_view->{tombstoned} ? 1 : 0;
+  my $new_tombstoned = ref($new_view) eq 'HASH' && $new_view->{tombstoned} ? 1 : 0;
+
+  if ($new_tombstoned) {
+    $self->_apply_authoritative_channel_tombstone(
+      $channel,
+      reason => 'channel deleted',
+    ) unless $old_tombstoned;
+    return 1;
+  }
 
   if (!$suppress_render && ($event->{kind} || 0) == 9002) {
     my $actor_nick = $self->_authoritative_nick_for_pubkey(
@@ -4407,6 +4576,7 @@ sub _list_entries {
         force => 1,
       );
       next unless ref($view) eq 'HASH' || ref($state) eq 'HASH';
+      next if ref($view) eq 'HASH' && $view->{tombstoned};
 
       my $visible_users = ref($view) eq 'HASH' && ref($view->{present_members}) eq 'ARRAY'
         ? scalar(@{$view->{present_members}})
