@@ -1213,7 +1213,13 @@ sub _handle_client_line {
         return 1;
       }
 
-      if ($self->_channel_is_moderated_for_client($channel, $client)) {
+      if ($self->_is_authoritative_channel($channel)) {
+        my $permission = $self->_authoritative_speak_permission_for_client($channel, $client);
+        unless ($permission->{allowed}) {
+          $self->_send_cannot_send_to_channel($client_id, $channel);
+          return 1;
+        }
+      } elsif ($self->_channel_is_moderated_for_client($channel, $client)) {
         $self->_send_cannot_send_to_channel($client_id, $channel);
         return 1;
       }
@@ -1289,17 +1295,26 @@ sub _handle_client_line {
       return 1;
     }
 
-    if ($self->_channel_is_topic_restricted_for_client($channel, $client)) {
-      $self->_send_chan_op_privs_needed($client_id, $channel);
-      return 1;
-    }
-
     if ($self->_is_authoritative_channel($channel)) {
+      my $permission = $self->_authoritative_topic_permission_for_client($channel, $client);
+      unless ($permission->{allowed}) {
+        if (($permission->{reason} || '') eq 'deleted') {
+          $self->_send_no_such_channel($client_id, $channel);
+        } else {
+          $self->_send_chan_op_privs_needed($client_id, $channel);
+        }
+        return 1;
+      }
       return $self->_handle_authoritative_topic_command(
         client_id => $client_id,
         channel   => $channel,
         text      => $params[1],
       );
+    }
+
+    if ($self->_channel_is_topic_restricted_for_client($channel, $client)) {
+      $self->_send_chan_op_privs_needed($client_id, $channel);
+      return 1;
     }
 
     $self->_emit_client_input(
@@ -2953,6 +2968,33 @@ sub _derive_authoritative_join_admission_from_events {
   return $result->{admission}[0];
 }
 
+sub _derive_authoritative_permission_from_events {
+  my ($self, $operation, $channel, $authoritative_events, %args) = @_;
+  return undef unless defined $operation && !ref($operation) && length($operation);
+  return undef unless $self->_is_authoritative_channel($channel);
+  return undef unless ref($authoritative_events) eq 'ARRAY';
+
+  my $result = eval {
+    $self->_request(
+      method => 'adapters.derive',
+      params => {
+        adapter_session_id => $self->{adapter_session_id},
+        operation          => $operation,
+        input              => {
+          network              => $self->{config}{network},
+          target               => $self->_canonical_channel_name($channel),
+          authoritative_events => $authoritative_events,
+          (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
+          (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
+        },
+      },
+    );
+  };
+  return undef if $@;
+  return undef unless ref($result->{permission}) eq 'ARRAY' && @{$result->{permission}};
+  return $result->{permission}[0];
+}
+
 sub _authoritative_channel_state_from_view {
   my ($self, $view) = @_;
   return undef unless ref($view) eq 'HASH';
@@ -3068,6 +3110,54 @@ sub _derive_authoritative_join_admission {
   );
 }
 
+sub _derive_authoritative_speak_permission {
+  my ($self, $channel, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_permission_from_events(
+    'authoritative_speak_permission',
+    $canonical,
+    $cache->{events},
+    %args,
+  );
+}
+
+sub _derive_authoritative_topic_permission {
+  my ($self, $channel, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_permission_from_events(
+    'authoritative_topic_permission',
+    $canonical,
+    $cache->{events},
+    %args,
+  );
+}
+
 sub _authoritative_join_admission_is_populated {
   my ($self, $admission) = @_;
   return 0 unless ref($admission) eq 'HASH';
@@ -3079,6 +3169,16 @@ sub _authoritative_join_admission_is_populated {
   return 1 if exists $admission->{create_channel};
   return 1 if exists $admission->{auth_required};
   return 1 if exists $admission->{reason};
+  return 0;
+}
+
+sub _authoritative_permission_is_populated {
+  my ($self, $permission) = @_;
+  return 0 unless ref($permission) eq 'HASH';
+  return 1 if exists $permission->{allowed};
+  return 1 if exists $permission->{reason};
+  return 1 if exists $permission->{roles};
+  return 1 if exists $permission->{presentational_prefix};
   return 0;
 }
 
@@ -3547,6 +3647,70 @@ sub _authoritative_join_admission_for_client {
     (defined $admission->{create_channel} ? (create_channel => $admission->{create_channel} ? 1 : 0) : ()),
     (defined $admission->{auth_required} ? (auth_required => $admission->{auth_required} ? 1 : 0) : ()),
     reason  => defined $admission->{reason} ? $admission->{reason} : '',
+  };
+}
+
+sub _authoritative_speak_permission_for_client {
+  my ($self, $channel, $client) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  return {
+    allowed => $self->_channel_is_moderated_for_client($channel, $client) ? 0 : 1,
+    reason  => $self->_channel_is_moderated_for_client($channel, $client) ? '+m' : '',
+  } unless defined $pubkey;
+
+  my $permission = $self->_derive_authoritative_speak_permission(
+    $channel,
+    actor_pubkey => $pubkey,
+  );
+  if (!$self->_authoritative_permission_is_populated($permission)) {
+    $permission = $self->_derive_authoritative_speak_permission(
+      $channel,
+      force        => 1,
+      actor_pubkey => $pubkey,
+    );
+  }
+
+  return {
+    allowed => $permission->{allowed} ? 1 : 0,
+    reason  => defined $permission->{reason} ? $permission->{reason} : '',
+  } if $self->_authoritative_permission_is_populated($permission)
+    && (($permission->{reason} || '') ne 'authoritative state unavailable');
+
+  return {
+    allowed => $self->_channel_is_moderated_for_client($channel, $client) ? 0 : 1,
+    reason  => $self->_channel_is_moderated_for_client($channel, $client) ? '+m' : '',
+  };
+}
+
+sub _authoritative_topic_permission_for_client {
+  my ($self, $channel, $client) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  return {
+    allowed => $self->_channel_is_topic_restricted_for_client($channel, $client) ? 0 : 1,
+    reason  => $self->_channel_is_topic_restricted_for_client($channel, $client) ? '+t' : '',
+  } unless defined $pubkey;
+
+  my $permission = $self->_derive_authoritative_topic_permission(
+    $channel,
+    actor_pubkey => $pubkey,
+  );
+  if (!$self->_authoritative_permission_is_populated($permission)) {
+    $permission = $self->_derive_authoritative_topic_permission(
+      $channel,
+      force        => 1,
+      actor_pubkey => $pubkey,
+    );
+  }
+
+  return {
+    allowed => $permission->{allowed} ? 1 : 0,
+    reason  => defined $permission->{reason} ? $permission->{reason} : '',
+  } if $self->_authoritative_permission_is_populated($permission)
+    && (($permission->{reason} || '') ne 'authoritative state unavailable');
+
+  return {
+    allowed => $self->_channel_is_topic_restricted_for_client($channel, $client) ? 0 : 1,
+    reason  => $self->_channel_is_topic_restricted_for_client($channel, $client) ? '+t' : '',
   };
 }
 
