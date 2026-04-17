@@ -2871,6 +2871,22 @@ sub _read_authoritative_nip29_events {
     : [];
 }
 
+sub _authoritative_channel_is_known {
+  my ($self, $channel) = @_;
+  return 0 unless $self->_is_authoritative_channel($channel);
+
+  my $canonical = $self->_canonical_channel_name($channel);
+  return 0 unless defined $canonical;
+
+  return 1 if exists $self->{authoritative_discovered_channels}{$canonical};
+
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  return 0 unless ref($cache) eq 'HASH';
+
+  return 1 if ref($cache->{events}) eq 'ARRAY' && @{$cache->{events}};
+  return 0;
+}
+
 sub _derive_authoritative_channel_view_from_events {
   my ($self, $channel, $authoritative_events, %args) = @_;
   return undef unless $self->_is_authoritative_channel($channel);
@@ -3317,6 +3333,14 @@ sub _authoritative_join_admission_for_client {
   $events = $self->_read_authoritative_nip29_events($channel, force => 1)
     if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled;
   if (ref($events) eq 'ARRAY' && !@{$events}) {
+    if ($self->_authoritative_channel_is_known($channel)) {
+      return {
+        allowed       => 0,
+        create_channel => 0,
+        auth_required => 0,
+        reason        => 'authoritative state unavailable',
+      };
+    }
     return {
       allowed      => $pubkey ? 1 : 0,
       create_channel => $pubkey ? 1 : 0,
