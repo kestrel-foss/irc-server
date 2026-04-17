@@ -832,6 +832,25 @@ sub _handle_client_line {
       );
     }
 
+    if ($subcommand eq 'UNDELETE') {
+      my $channel_input = $params[1];
+      unless ($self->_is_channel_name($channel_input)) {
+        $self->_send_no_such_channel($client_id, $channel_input);
+        return 1;
+      }
+
+      my $channel = $self->_canonical_channel_name($channel_input);
+      unless ($self->_is_authoritative_channel($channel)) {
+        $self->_send_no_such_channel($client_id, $channel_input);
+        return 1;
+      }
+
+      return $self->_handle_authoritative_undelete_command(
+        client_id => $client_id,
+        channel   => $channel,
+      );
+    }
+
     $self->_send_unknown_command($client_id, 'OVERNETCHANNEL');
     return 1;
   }
@@ -1035,7 +1054,8 @@ sub _handle_client_line {
       if ($self->_authority_relay_enabled) {
         my $needs_authoritative_join_write = $authoritative_join->{create_channel}
           || defined($authoritative_join->{invite_code})
-          || !$authoritative_join->{member};
+          || !$authoritative_join->{member}
+          || !$authoritative_join->{present};
         if ($needs_authoritative_join_write && !$self->_client_has_authoritative_delegation($client)) {
           $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative JOIN');
           return 1;
@@ -1063,7 +1083,8 @@ sub _handle_client_line {
       } else {
         my $needs_authoritative_join_emit = $authoritative_join->{create_channel}
           || defined($authoritative_join->{invite_code})
-          || !$authoritative_join->{member};
+          || !$authoritative_join->{member}
+          || !$authoritative_join->{present};
         if ($needs_authoritative_join_emit) {
           return 1 unless $self->_emit_client_input(
             $client,
@@ -2901,6 +2922,15 @@ sub _authoritative_channel_state_from_view {
         presentational_prefix => $_->{presentational_prefix},
       } } @{$view->{members} || []}
     ],
+    (ref($view->{retained_members}) eq 'ARRAY' ? (
+      retained_members => [
+        map { +{
+          pubkey                => $_->{pubkey},
+          roles                 => [ @{$_->{roles} || []} ],
+          presentational_prefix => $_->{presentational_prefix},
+        } } @{$view->{retained_members}}
+      ],
+    ) : ()),
   };
 }
 
@@ -3067,11 +3097,14 @@ sub _authoritative_nick_for_pubkey {
 }
 
 sub _authoritative_member_for_pubkey {
-  my ($self, $state, $pubkey) = @_;
+  my ($self, $state, $pubkey, %args) = @_;
   return undef unless ref($state) eq 'HASH';
   return undef unless defined $pubkey && !ref($pubkey) && length($pubkey);
+  my $field = defined $args{field} && !ref($args{field}) && length($args{field})
+    ? $args{field}
+    : 'members';
 
-  for my $member (@{$state->{members} || []}) {
+  for my $member (@{$state->{$field} || []}) {
     next unless ref($member) eq 'HASH';
     next unless defined $member->{pubkey};
     return $member if $member->{pubkey} eq $pubkey;
@@ -3092,9 +3125,30 @@ sub _authoritative_roles_for_client {
   return @{$member->{roles} || []};
 }
 
+sub _authoritative_retained_roles_for_client {
+  my ($self, $channel, $client) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  return () unless defined $pubkey;
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return () unless ref($state) eq 'HASH';
+  my $member = $self->_authoritative_member_for_pubkey(
+    $state,
+    $pubkey,
+    field => 'retained_members',
+  );
+  return () unless ref($member) eq 'HASH';
+  return @{$member->{roles} || []};
+}
+
 sub _client_is_authoritative_operator {
   my ($self, $channel, $client) = @_;
   return scalar grep { $_ eq 'irc.operator' } $self->_authoritative_roles_for_client($channel, $client);
+}
+
+sub _client_is_retained_authoritative_operator {
+  my ($self, $channel, $client) = @_;
+  return scalar grep { $_ eq 'irc.operator' } $self->_authoritative_retained_roles_for_client($channel, $client);
 }
 
 sub _client_has_authoritative_voice {
@@ -3297,9 +3351,17 @@ sub _authoritative_join_admission_for_client {
   } unless ref($view) eq 'HASH';
 
   if (ref($view->{admission}) eq 'HASH') {
+    my $present = defined $pubkey
+      ? scalar grep {
+          ref($_) eq 'HASH'
+            && defined($_->{pubkey})
+            && $_->{pubkey} eq $pubkey
+        } @{$view->{present_members} || []}
+      : 0;
     return {
       allowed => $view->{admission}{allowed} ? 1 : 0,
       (defined $view->{admission}{member} ? (member => $view->{admission}{member} ? 1 : 0) : ()),
+      present => $present ? 1 : 0,
       (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
       (defined $view->{admission}{deleted} ? (deleted => $view->{admission}{deleted} ? 1 : 0) : ()),
       reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
@@ -3317,6 +3379,7 @@ sub _authoritative_join_admission_for_client {
   my $state = $self->_authoritative_channel_state_from_view($view);
   return {
     allowed => $self->_channel_mode_enabled($state, 'i') ? 0 : 1,
+    present => 0,
     reason  => $self->_channel_mode_enabled($state, 'i') ? '+i' : '',
   };
 }
@@ -3543,6 +3606,53 @@ sub _handle_authoritative_delete_command {
   }
 
   $self->_send_server_notice($client_id, "OVERNETCHANNEL DELETE $channel");
+  return 1;
+}
+
+sub _handle_authoritative_undelete_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return $self->_send_no_such_channel($client_id, $channel)
+    unless ref($state) eq 'HASH';
+  return $self->_send_no_such_channel($client_id, $channel)
+    unless $state->{tombstoned};
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $self->_client_is_retained_authoritative_operator($channel, $client);
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless defined $actor_pubkey;
+
+  if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
+    $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative channel undeletion');
+    return 1;
+  }
+
+  my %input = (
+    command        => 'UNDELETE',
+    target         => $channel,
+    actor_pubkey   => $actor_pubkey,
+    group_metadata => $self->_authoritative_group_metadata_from_state($state),
+  );
+  if ($self->_authority_relay_enabled) {
+    unless ($self->_publish_authoritative_input($client, \%input)) {
+      $self->_send_server_notice(
+        $client_id,
+        $self->{authoritative_publish_error} || 'authoritative relay publish failed',
+      );
+      return 1;
+    }
+  } else {
+    return 1 unless $self->_emit_client_input($client, \%input);
+    $self->_refresh_authoritative_nip29_channel_cache($channel);
+  }
+
+  $self->_send_server_notice($client_id, "OVERNETCHANNEL UNDELETE $channel");
   return 1;
 }
 
