@@ -2986,6 +2986,7 @@ sub _derive_authoritative_permission_from_events {
           authoritative_events => $authoritative_events,
           (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
           (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
+          (ref($args{extra_input}) eq 'HASH' ? %{$args{extra_input}} : ()),
         },
       },
     );
@@ -3155,6 +3156,62 @@ sub _derive_authoritative_topic_permission {
     $canonical,
     $cache->{events},
     %args,
+  );
+}
+
+sub _derive_authoritative_mode_write_permission {
+  my ($self, $channel, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_permission_from_events(
+    'authoritative_mode_write_permission',
+    $canonical,
+    $cache->{events},
+    actor_pubkey => $args{actor_pubkey},
+    extra_input  => {
+      mode      => $args{mode},
+      mode_args => ref($args{mode_args}) eq 'ARRAY' ? $args{mode_args} : [],
+    },
+  );
+}
+
+sub _derive_authoritative_channel_action_permission {
+  my ($self, $channel, %args) = @_;
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_permission_from_events(
+    'authoritative_channel_action_permission',
+    $canonical,
+    $cache->{events},
+    actor_pubkey => $args{actor_pubkey},
+    extra_input  => {
+      action => $args{action},
+      (defined $args{target_pubkey} ? (target_pubkey => $args{target_pubkey}) : ()),
+    },
   );
 }
 
@@ -3714,6 +3771,147 @@ sub _authoritative_topic_permission_for_client {
   };
 }
 
+sub _authoritative_mode_write_permission_for_client {
+  my ($self, $channel, $client, %args) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  my $mode = $args{mode};
+  my $mode_args = ref($args{mode_args}) eq 'ARRAY' ? $args{mode_args} : [];
+
+  if (defined $pubkey) {
+    my $permission = $self->_derive_authoritative_mode_write_permission(
+      $channel,
+      actor_pubkey => $pubkey,
+      mode         => $mode,
+      mode_args    => $mode_args,
+    );
+    if (!$self->_authoritative_permission_is_populated($permission)) {
+      $permission = $self->_derive_authoritative_mode_write_permission(
+        $channel,
+        force       => 1,
+        actor_pubkey => $pubkey,
+        mode        => $mode,
+        mode_args   => $mode_args,
+      );
+    }
+
+    if ($self->_authoritative_permission_is_populated($permission)
+        && (($permission->{reason} || '') ne 'authoritative state unavailable')) {
+      return {
+        allowed            => $permission->{allowed} ? 1 : 0,
+        reason             => defined($permission->{reason}) ? $permission->{reason} : '',
+        (defined $permission->{target_pubkey} ? (target_pubkey => $permission->{target_pubkey}) : ()),
+        (ref($permission->{current_roles}) eq 'ARRAY' ? (current_roles => [ @{$permission->{current_roles}} ]) : ()),
+        (defined $permission->{normalized_ban_mask} ? (normalized_ban_mask => $permission->{normalized_ban_mask}) : ()),
+        (ref($permission->{group_metadata}) eq 'HASH' ? (group_metadata => { %{$permission->{group_metadata}} }) : ()),
+      };
+    }
+  }
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return {
+    allowed => 0,
+    reason  => 'state_unavailable',
+  } unless ref($state) eq 'HASH';
+  return {
+    allowed => 0,
+    reason  => 'deleted',
+  } if $state->{tombstoned};
+  return {
+    allowed => 0,
+    reason  => 'not_operator',
+  } unless defined($pubkey) && $self->_client_is_authoritative_operator($channel, $client);
+
+  my %permission = (
+    allowed => 1,
+    reason  => '',
+  );
+  if ($mode =~ /\A[+-][ov]\z/ && defined($mode_args->[0])) {
+    my $target_pubkey = $mode_args->[0];
+    my $member = $self->_authoritative_member_for_pubkey($state, $target_pubkey) || {};
+    $permission{target_pubkey} = $target_pubkey;
+    $permission{current_roles} = [ @{$member->{roles} || []} ];
+  } elsif ($mode =~ /\A[+-][b]\z/ && defined($mode_args->[0])) {
+    $permission{normalized_ban_mask} = $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A[+-][imt]\z/) {
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  }
+
+  return \%permission;
+}
+
+sub _authoritative_channel_action_permission_for_client {
+  my ($self, $channel, $client, %args) = @_;
+  my $pubkey = $self->_client_authoritative_pubkey($client);
+  my $action = $args{action};
+
+  if (defined $pubkey) {
+    my $permission = $self->_derive_authoritative_channel_action_permission(
+      $channel,
+      actor_pubkey => $pubkey,
+      action       => $action,
+      (defined $args{target_pubkey} ? (target_pubkey => $args{target_pubkey}) : ()),
+    );
+    if (!$self->_authoritative_permission_is_populated($permission)) {
+      $permission = $self->_derive_authoritative_channel_action_permission(
+        $channel,
+        force        => 1,
+        actor_pubkey => $pubkey,
+        action       => $action,
+        (defined $args{target_pubkey} ? (target_pubkey => $args{target_pubkey}) : ()),
+      );
+    }
+
+    if ($self->_authoritative_permission_is_populated($permission)
+        && (($permission->{reason} || '') ne 'authoritative state unavailable')) {
+      return {
+        allowed       => $permission->{allowed} ? 1 : 0,
+        reason        => defined($permission->{reason}) ? $permission->{reason} : '',
+        (defined $permission->{target_pubkey} ? (target_pubkey => $permission->{target_pubkey}) : ()),
+        (ref($permission->{group_metadata}) eq 'HASH' ? (group_metadata => { %{$permission->{group_metadata}} }) : ()),
+      };
+    }
+  }
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return {
+    allowed => 0,
+    reason  => 'state_unavailable',
+  } unless ref($state) eq 'HASH';
+
+  if (($action || '') eq 'undelete') {
+    return {
+      allowed => 0,
+      reason  => 'not_deleted',
+    } unless $state->{tombstoned};
+    return {
+      allowed => 0,
+      reason  => 'not_operator',
+    } unless defined($pubkey) && $self->_client_is_retained_authoritative_operator($channel, $client);
+    return {
+      allowed        => 1,
+      reason         => '',
+      group_metadata => $self->_authoritative_group_metadata_from_state($state),
+    };
+  }
+
+  return {
+    allowed => 0,
+    reason  => 'deleted',
+  } if $state->{tombstoned};
+  return {
+    allowed => 0,
+    reason  => 'not_operator',
+  } unless defined($pubkey) && $self->_client_is_authoritative_operator($channel, $client);
+
+  return {
+    allowed        => 1,
+    reason         => '',
+    (defined $args{target_pubkey} ? (target_pubkey => $args{target_pubkey}) : ()),
+    (($action || '') eq 'delete' ? (group_metadata => $self->_authoritative_group_metadata_from_state($state)) : ()),
+  };
+}
+
 sub _authoritative_name_entries_for_channel {
   my ($self, $client, $channel, %args) = @_;
   return () unless ref($client) eq 'HASH';
@@ -3901,17 +4099,20 @@ sub _handle_authoritative_delete_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action => 'delete',
+  );
   return $self->_send_no_such_channel($client_id, $channel)
-    unless ref($state) eq 'HASH';
-  return $self->_send_no_such_channel($client_id, $channel)
-    if $state->{tombstoned};
+    if (($permission->{reason} || '') eq 'deleted');
   return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless $self->_client_is_authoritative_operator($channel, $client);
+    unless $permission->{allowed};
 
   my $actor_pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless defined $actor_pubkey;
+  my $group_metadata = ref($permission->{group_metadata}) eq 'HASH'
+    ? $permission->{group_metadata}
+    : undef;
 
   if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
     $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative channel deletion');
@@ -3922,7 +4123,7 @@ sub _handle_authoritative_delete_command {
     command        => 'DELETE',
     target         => $channel,
     actor_pubkey   => $actor_pubkey,
-    group_metadata => $self->_authoritative_group_metadata_from_state($state),
+    group_metadata => $group_metadata,
   );
   if ($self->_authority_relay_enabled) {
     unless ($self->_publish_authoritative_input($client, \%input)) {
@@ -3948,17 +4149,20 @@ sub _handle_authoritative_undelete_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action => 'undelete',
+  );
   return $self->_send_no_such_channel($client_id, $channel)
-    unless ref($state) eq 'HASH';
-  return $self->_send_no_such_channel($client_id, $channel)
-    unless $state->{tombstoned};
+    if (($permission->{reason} || '') eq 'not_deleted');
   return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless $self->_client_is_retained_authoritative_operator($channel, $client);
+    unless $permission->{allowed};
 
   my $actor_pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless defined $actor_pubkey;
+  my $group_metadata = ref($permission->{group_metadata}) eq 'HASH'
+    ? $permission->{group_metadata}
+    : undef;
 
   if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
     $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative channel undeletion');
@@ -3969,7 +4173,7 @@ sub _handle_authoritative_undelete_command {
     command        => 'UNDELETE',
     target         => $channel,
     actor_pubkey   => $actor_pubkey,
-    group_metadata => $self->_authoritative_group_metadata_from_state($state),
+    group_metadata => $group_metadata,
   );
   if ($self->_authority_relay_enabled) {
     unless ($self->_publish_authoritative_input($client, \%input)) {
@@ -3996,13 +4200,13 @@ sub _handle_authoritative_mode_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless ref($state) eq 'HASH';
-
   my $mode = $params[1];
   return $self->_send_need_more_params($client_id, 'MODE')
     unless defined $mode && !ref($mode) && length($mode);
+
+  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless ref($state) eq 'HASH';
 
   if ($mode eq '+b' && (!defined($params[2]) || ref($params[2]) || !length($params[2]))) {
     for my $ban_mask (@{$state->{ban_masks} || []}) {
@@ -4012,20 +4216,7 @@ sub _handle_authoritative_mode_command {
     return 1;
   }
 
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless $self->_client_is_authoritative_operator($channel, $client);
-
-  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless defined $actor_pubkey;
-
-  my %input = (
-    command      => 'MODE',
-    target       => $channel,
-    mode         => $mode,
-    actor_pubkey => $actor_pubkey,
-  );
-
+  my @mode_args;
   my $mode_line = sprintf(':%s MODE %s %s', $client->{nick}, $channel, $mode);
   if ($mode =~ /\A[+-][ov]\z/) {
     return $self->_send_need_more_params($client_id, 'MODE')
@@ -4040,23 +4231,46 @@ sub _handle_authoritative_mode_command {
     my $target_pubkey = $self->_client_authoritative_pubkey($target_client);
     return $self->_send_no_such_nick($client_id, $params[2])
       unless defined $target_pubkey;
-
-    my $member = $self->_authoritative_member_for_pubkey($state, $target_pubkey) || {};
-    $input{target_pubkey} = $target_pubkey;
-    $input{current_roles} = [ @{$member->{roles} || []} ];
+    @mode_args = ($target_pubkey);
     $mode_line .= ' ' . $target_nick;
   } elsif ($mode =~ /\A[+-][bimt]\z/) {
-    $input{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
     if ($mode =~ /\A[+-]b\z/) {
       return $self->_send_need_more_params($client_id, 'MODE')
         unless defined $params[2] && !ref($params[2]) && length($params[2]);
-      $input{ban_mask} = $params[2];
+      @mode_args = ($params[2]);
       $mode_line .= ' ' . $params[2];
     }
   } else {
     $self->_send_unknown_command($client_id, 'MODE');
     return 1;
   }
+
+  my $permission = $self->_authoritative_mode_write_permission_for_client(
+    $channel,
+    $client,
+    mode      => $mode,
+    mode_args => \@mode_args,
+  );
+  return $self->_send_no_such_channel($client_id, $channel)
+    if (($permission->{reason} || '') eq 'deleted');
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $permission->{allowed};
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  my %input = (
+    command      => 'MODE',
+    target       => $channel,
+    mode         => $mode,
+    actor_pubkey => $actor_pubkey,
+  );
+  $input{target_pubkey} = $permission->{target_pubkey}
+    if defined $permission->{target_pubkey};
+  $input{current_roles} = [ @{$permission->{current_roles}} ]
+    if ref($permission->{current_roles}) eq 'ARRAY';
+  $input{group_metadata} = $permission->{group_metadata}
+    if ref($permission->{group_metadata}) eq 'HASH';
+  $input{ban_mask} = $permission->{normalized_ban_mask}
+    if defined $permission->{normalized_ban_mask};
 
   if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
     $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative MODE');
@@ -4086,16 +4300,6 @@ sub _handle_authoritative_kick_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless ref($state) eq 'HASH';
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless $self->_client_is_authoritative_operator($channel, $client);
-
-  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless defined $actor_pubkey;
-
   my $target_nick = $self->_canonical_current_nick($params[1]);
   return $self->_send_no_such_nick($client_id, $params[1])
     unless defined $target_nick;
@@ -4106,6 +4310,18 @@ sub _handle_authoritative_kick_command {
   return $self->_send_no_such_nick($client_id, $params[1])
     unless defined $target_pubkey;
 
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action       => 'kick',
+    target_pubkey => $target_pubkey,
+  );
+  return $self->_send_no_such_channel($client_id, $channel)
+    if (($permission->{reason} || '') eq 'deleted');
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $permission->{allowed};
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
   my $reason = @params >= 3 ? $params[2] : undef;
   if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
     $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative KICK');
@@ -4116,7 +4332,7 @@ sub _handle_authoritative_kick_command {
     command       => 'KICK',
     target        => $channel,
     actor_pubkey  => $actor_pubkey,
-    target_pubkey => $target_pubkey,
+    target_pubkey => $permission->{target_pubkey},
     (defined $reason ? (text => $reason) : ()),
   );
   if ($self->_authority_relay_enabled) {
@@ -4151,16 +4367,6 @@ sub _handle_authoritative_invite_command {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $state = $self->_authoritative_channel_state_for_enforcement($channel);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless ref($state) eq 'HASH';
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless $self->_client_is_authoritative_operator($channel, $client);
-
-  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
-  return $self->_send_chan_op_privs_needed($client_id, $channel)
-    unless defined $actor_pubkey;
-
   my $target_nick = $self->_canonical_current_nick($target_nick_input);
   return $self->_send_no_such_nick($client_id, $target_nick_input)
     unless defined $target_nick;
@@ -4171,6 +4377,18 @@ sub _handle_authoritative_invite_command {
   return $self->_send_no_such_nick($client_id, $target_nick_input)
     unless defined $target_pubkey;
 
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action        => 'invite',
+    target_pubkey => $target_pubkey,
+  );
+  return $self->_send_no_such_channel($client_id, $channel)
+    if (($permission->{reason} || '') eq 'deleted');
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $permission->{allowed};
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
   my $invite_code = $self->_generate_authoritative_invite_code(
     channel       => $channel,
     actor_pubkey  => $actor_pubkey,
@@ -4187,7 +4405,7 @@ sub _handle_authoritative_invite_command {
     target        => $channel,
     actor_pubkey  => $actor_pubkey,
     target_nick   => $target_nick,
-    target_pubkey => $target_pubkey,
+    target_pubkey => $permission->{target_pubkey},
     invite_code   => $invite_code,
   );
   if ($self->_authority_relay_enabled) {
