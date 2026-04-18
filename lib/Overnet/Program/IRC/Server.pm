@@ -2916,8 +2916,9 @@ sub _authoritative_channel_is_known {
   return 0;
 }
 
-sub _derive_authoritative_channel_view_from_events {
-  my ($self, $channel, $authoritative_events, %args) = @_;
+sub _derive_authoritative_view_from_events {
+  my ($self, $operation, $channel, $authoritative_events, %args) = @_;
+  return undef unless defined $operation && !ref($operation) && length($operation);
   return undef unless $self->_is_authoritative_channel($channel);
   return undef unless ref($authoritative_events) eq 'ARRAY';
 
@@ -2926,13 +2927,14 @@ sub _derive_authoritative_channel_view_from_events {
       method => 'adapters.derive',
       params => {
         adapter_session_id => $self->{adapter_session_id},
-        operation          => 'authoritative_channel_view',
+        operation          => $operation,
         input              => {
           network              => $self->{config}{network},
           target               => $self->_canonical_channel_name($channel),
           authoritative_events => $authoritative_events,
           (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
           (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
+          (ref($args{extra_input}) eq 'HASH' ? %{$args{extra_input}} : ()),
         },
       },
     );
@@ -2940,6 +2942,16 @@ sub _derive_authoritative_channel_view_from_events {
   return undef if $@;
   return undef unless ref($result->{view}) eq 'ARRAY' && @{$result->{view}};
   return $result->{view}[0];
+}
+
+sub _derive_authoritative_channel_view_from_events {
+  my ($self, $channel, $authoritative_events, %args) = @_;
+  return $self->_derive_authoritative_view_from_events(
+    'authoritative_channel_view',
+    $channel,
+    $authoritative_events,
+    %args,
+  );
 }
 
 sub _derive_authoritative_join_admission_from_events {
@@ -2994,6 +3006,31 @@ sub _derive_authoritative_permission_from_events {
   return undef if $@;
   return undef unless ref($result->{permission}) eq 'ARRAY' && @{$result->{permission}};
   return $result->{permission}[0];
+}
+
+sub _derive_authoritative_view {
+  my ($self, $operation, $channel, %args) = @_;
+  return undef unless defined $operation && !ref($operation) && length($operation);
+  return undef unless $self->_is_authoritative_channel($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  return undef unless defined $canonical;
+  my $cache = $self->{authoritative_channel_cache}{$canonical};
+  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
+  if ($refresh) {
+    $self->_refresh_authoritative_nip29_channel_cache(
+      $canonical,
+      ($args{force} && $self->_authority_relay_enabled ? (refresh => 1) : ()),
+    );
+    $cache = $self->{authoritative_channel_cache}{$canonical};
+  }
+
+  return undef unless $cache && ref($cache->{events}) eq 'ARRAY';
+  return $self->_derive_authoritative_view_from_events(
+    $operation,
+    $canonical,
+    $cache->{events},
+    %args,
+  );
 }
 
 sub _authoritative_channel_state_from_view {
@@ -3071,6 +3108,24 @@ sub _derive_authoritative_channel_view {
   ) if defined $args{actor_pubkey};
 
   return $cache->{view};
+}
+
+sub _derive_authoritative_ban_list_view {
+  my ($self, $channel, %args) = @_;
+  return $self->_derive_authoritative_view(
+    'authoritative_ban_list_view',
+    $channel,
+    %args,
+  );
+}
+
+sub _derive_authoritative_list_entry_view {
+  my ($self, $channel, %args) = @_;
+  return $self->_derive_authoritative_view(
+    'authoritative_list_entry_view',
+    $channel,
+    %args,
+  );
 }
 
 sub _derive_authoritative_join_admission {
@@ -4209,7 +4264,15 @@ sub _handle_authoritative_mode_command {
     unless ref($state) eq 'HASH';
 
   if ($mode eq '+b' && (!defined($params[2]) || ref($params[2]) || !length($params[2]))) {
-    for my $ban_mask (@{$state->{ban_masks} || []}) {
+    my $ban_list_view = $self->_derive_authoritative_ban_list_view($channel);
+    $ban_list_view = $self->_derive_authoritative_ban_list_view(
+      $channel,
+      force => 1,
+    ) unless ref($ban_list_view) eq 'HASH';
+    my $ban_masks = ref($ban_list_view) eq 'HASH' && ref($ban_list_view->{ban_masks}) eq 'ARRAY'
+      ? $ban_list_view->{ban_masks}
+      : $state->{ban_masks} || [];
+    for my $ban_mask (@{$ban_masks}) {
       $self->_send_ban_list_entry($client_id, $channel, $ban_mask);
     }
     $self->_send_end_of_ban_list($client_id, $channel);
@@ -5231,14 +5294,25 @@ sub _list_entries {
     my $state = $self->{channels}{$channel_key};
 
     if ($self->_is_authoritative_channel($channel)) {
+      my $list_view = $self->_derive_authoritative_list_entry_view(
+        $channel,
+        force => 1,
+      );
       my $view = $self->_derive_authoritative_channel_view(
         $channel,
         force => 1,
       );
       next unless ref($view) eq 'HASH' || ref($state) eq 'HASH';
+      next if ref($list_view) eq 'HASH'
+        && exists($list_view->{visible_in_list})
+        && !$list_view->{visible_in_list};
       next if ref($view) eq 'HASH' && $view->{tombstoned};
 
-      my $visible_users = ref($view) eq 'HASH' && ref($view->{present_members}) eq 'ARRAY'
+      my $visible_users = ref($list_view) eq 'HASH'
+        && defined($list_view->{visible_users})
+        && !ref($list_view->{visible_users})
+          ? $list_view->{visible_users}
+        : ref($view) eq 'HASH' && ref($view->{present_members}) eq 'ARRAY'
         ? scalar(@{$view->{present_members}})
         : 0;
       if (!$visible_users && ref($state) eq 'HASH') {
@@ -5254,7 +5328,12 @@ sub _list_entries {
         $visible_users = scalar(keys %presented_nicks);
       }
 
-      my $display_channel = ref($state) eq 'HASH'
+      my $display_channel = ref($list_view) eq 'HASH'
+        && defined($list_view->{channel})
+        && !ref($list_view->{channel})
+        && length($list_view->{channel})
+          ? $list_view->{channel}
+        : ref($state) eq 'HASH'
         && defined $state->{channel_name}
         && !ref($state->{channel_name})
         && length($state->{channel_name})
@@ -5262,7 +5341,9 @@ sub _list_entries {
           : exists($self->{authoritative_discovered_channels}{$channel})
           ? $self->{authoritative_discovered_channels}{$channel}{channel_name}
           : $channel;
-      my $topic = ref($view) eq 'HASH' && exists($view->{topic})
+      my $topic = ref($list_view) eq 'HASH' && exists($list_view->{topic})
+        ? $list_view->{topic}
+        : ref($view) eq 'HASH' && exists($view->{topic})
         ? $view->{topic}
         : ref($state) eq 'HASH' && defined($state->{topic_text}) && !ref($state->{topic_text})
         ? $state->{topic_text}
