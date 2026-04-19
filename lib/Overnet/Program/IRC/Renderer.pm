@@ -257,6 +257,50 @@ sub inviting_line {
   );
 }
 
+sub authoritative_invite_list_entry_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 336 %s %s %s %s',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+    $args{target_pubkey},
+    $args{invite_code},
+  );
+}
+
+sub end_of_authoritative_invite_list_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 337 %s %s :End of authoritative invite list',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+  );
+}
+
+sub authoritative_join_request_list_entry_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 338 %s %s %s %s',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+    $args{requester_pubkey},
+    (defined($args{actor_mask}) && length($args{actor_mask}) ? $args{actor_mask} : '*'),
+  );
+}
+
+sub end_of_authoritative_join_request_list_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 339 %s %s :End of authoritative join request list',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+  );
+}
+
 sub channel_mode_is_line {
   my (%args) = @_;
   my $suffix = join ' ',
@@ -407,7 +451,7 @@ sub who_list_lines {
 sub whois_reply_lines {
   my (%args) = @_;
   my $entry = $args{entry} || {};
-  return [
+  my @lines = (
     sprintf(
       ':%s 311 %s %s %s %s * :%s',
       $args{server_name},
@@ -417,6 +461,17 @@ sub whois_reply_lines {
       $entry->{host},
       $entry->{realname},
     ),
+  );
+
+  push @lines, sprintf(
+    ':%s 330 %s %s %s :is logged in as',
+    $args{server_name},
+    $args{nick},
+    $entry->{nick},
+    $entry->{account},
+  ) if defined($entry->{account}) && !ref($entry->{account}) && length($entry->{account});
+
+  push @lines,
     sprintf(
       ':%s 312 %s %s %s :%s',
       $args{server_name},
@@ -430,8 +485,9 @@ sub whois_reply_lines {
       $args{server_name},
       $args{nick},
       $entry->{nick},
-    ),
-  ];
+    );
+
+  return \@lines;
 }
 
 sub nick_in_use_line {

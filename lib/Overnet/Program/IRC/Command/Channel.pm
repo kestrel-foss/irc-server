@@ -53,6 +53,48 @@ sub handle_overnetchannel {
     );
   }
 
+  if ($subcommand eq 'INVITES') {
+    my $channel_input = $params[1];
+    unless ($server->_is_channel_name($channel_input)) {
+      $server->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $client = $server->{clients}{$client_id}
+      or return 0;
+    my $channel = $server->_client_joined_channel_name($client, $channel_input);
+    unless (defined $channel) {
+      $server->_send_not_on_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    return $server->_handle_authoritative_invites_command(
+      client_id => $client_id,
+      channel   => $channel,
+    );
+  }
+
+  if ($subcommand eq 'REQUESTS') {
+    my $channel_input = $params[1];
+    unless ($server->_is_channel_name($channel_input)) {
+      $server->_send_no_such_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    my $client = $server->{clients}{$client_id}
+      or return 0;
+    my $channel = $server->_client_joined_channel_name($client, $channel_input);
+    unless (defined $channel) {
+      $server->_send_not_on_channel($client_id, $channel_input);
+      return 1;
+    }
+
+    return $server->_handle_authoritative_requests_command(
+      client_id => $client_id,
+      channel   => $channel,
+    );
+  }
+
   $server->_send_unknown_command($client_id, 'OVERNETCHANNEL');
   return 1;
 }
@@ -221,6 +263,48 @@ sub handle_join {
       }
       if ($authoritative_join->{deleted}) {
         $server->_send_no_such_channel($client_id, $channel);
+        return 1;
+      }
+      if ($authoritative_join->{pending_request}) {
+        $server->_send_server_notice($client_id, "Join request already pending for $channel");
+        return 1;
+      }
+      if ($authoritative_join->{request_join}) {
+        my $needs_authoritative_join_write = 1;
+        if ($server->_authority_relay_enabled) {
+          if ($needs_authoritative_join_write && !$server->_client_has_authoritative_delegation($client)) {
+            $server->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative JOIN');
+            return 1;
+          }
+          unless ($server->_publish_authoritative_input(
+              $client,
+              {
+                command      => 'JOIN',
+                target       => $channel,
+                actor_pubkey => $server->_client_authoritative_pubkey($client),
+                actor_mask   => $server->_authoritative_irc_mask_for_client($client),
+                (defined $join_key ? (join_key => $join_key) : ()),
+              },
+            )) {
+            $server->_send_server_notice(
+              $client_id,
+              $server->{authoritative_publish_error} || 'authoritative relay publish failed',
+            );
+            return 1;
+          }
+        } else {
+          return 1 unless $server->_emit_client_input(
+            $client,
+            {
+              command      => 'JOIN',
+              target       => $channel,
+              actor_pubkey => $server->_client_authoritative_pubkey($client),
+              actor_mask   => $server->_authoritative_irc_mask_for_client($client),
+              (defined $join_key ? (join_key => $join_key) : ()),
+            },
+          );
+        }
+        $server->_send_server_notice($client_id, "Join request submitted for $channel");
         return 1;
       }
       $server->_send_cannot_join_channel(

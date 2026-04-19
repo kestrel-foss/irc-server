@@ -36,6 +36,8 @@ sub handle_cap {
     my %supported = map { $_ => 1 } @supported;
     if (@requested && !grep { !$supported{$_} } @requested) {
       $client->{capabilities}{$_} = 1 for @requested;
+      $client->{capabilities}{'message-tags'} = 1
+        if $client->{capabilities}{'server-time'};
       return $server->_send_client_line(
         $client_id,
         sprintf(':%s CAP * ACK :%s', $server->{config}{server_name}, join(' ', @requested)),

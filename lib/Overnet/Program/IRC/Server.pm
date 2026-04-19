@@ -1261,9 +1261,64 @@ sub _send_list_reply {
     Overnet::Program::IRC::Renderer::list_reply_lines(
       server_name => $self->{config}{server_name},
       nick        => $nick,
-      entries     => [ $self->_list_entries($target) ],
+      entries     => [ $self->_list_entries($client, $target) ],
     ),
   );
+}
+
+sub _send_authoritative_invite_list_reply {
+  my ($self, $client_id, $channel, $pending_invites) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $nick = $self->_client_numeric_target($client);
+  my @lines = map {
+    Overnet::Program::IRC::Renderer::authoritative_invite_list_entry_line(
+      server_name  => $self->{config}{server_name},
+      nick         => $nick,
+      channel      => $channel,
+      target_pubkey => $_->{target_pubkey},
+      invite_code  => $_->{code},
+    )
+  } grep {
+    ref($_) eq 'HASH'
+      && defined($_->{target_pubkey}) && !ref($_->{target_pubkey}) && length($_->{target_pubkey})
+      && defined($_->{code}) && !ref($_->{code}) && length($_->{code})
+  } @{$pending_invites || []};
+
+  push @lines, Overnet::Program::IRC::Renderer::end_of_authoritative_invite_list_line(
+    server_name => $self->{config}{server_name},
+    nick        => $nick,
+    channel     => $channel,
+  );
+
+  return $self->_send_rendered_lines($client_id, \@lines);
+}
+
+sub _send_authoritative_join_request_list_reply {
+  my ($self, $client_id, $channel, $pending_join_requests) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+  my $nick = $self->_client_numeric_target($client);
+  my @lines = map {
+    Overnet::Program::IRC::Renderer::authoritative_join_request_list_entry_line(
+      server_name    => $self->{config}{server_name},
+      nick           => $nick,
+      channel        => $channel,
+      requester_pubkey => $_->{pubkey},
+      actor_mask     => $_->{actor_mask},
+    )
+  } grep {
+    ref($_) eq 'HASH'
+      && defined($_->{pubkey}) && !ref($_->{pubkey}) && length($_->{pubkey})
+  } @{$pending_join_requests || []};
+
+  push @lines, Overnet::Program::IRC::Renderer::end_of_authoritative_join_request_list_line(
+    server_name => $self->{config}{server_name},
+    nick        => $nick,
+    channel     => $channel,
+  );
+
+  return $self->_send_rendered_lines($client_id, \@lines);
 }
 
 sub _send_topic_reply {
@@ -1380,6 +1435,11 @@ sub _send_whois_reply {
         username => $username,
         host     => $host,
         realname => $realname,
+        (
+          defined($entry->{account}) && !ref($entry->{account}) && length($entry->{account})
+            ? (account => $entry->{account})
+            : ()
+        ),
       },
     ),
   );
@@ -1425,7 +1485,7 @@ sub _isupport_tokens {
 
 sub _supported_capabilities {
   my ($self) = @_;
-  my @capabilities = ('overnet-e2ee');
+  my @capabilities = ('message-tags', 'server-time', 'overnet-e2ee');
   push @capabilities, 'sasl'
     if $self->_authority_profile eq 'nip29';
   return @capabilities;
@@ -1859,6 +1919,9 @@ sub _authoritative_channel_state_from_view {
     (defined($view->{user_limit}) ? (user_limit => $view->{user_limit}) : ()),
     (exists $view->{topic} ? (topic => $view->{topic}) : ()),
     (exists $view->{topic_actor_pubkey} ? (topic_actor_pubkey => $view->{topic_actor_pubkey}) : ()),
+    ($view->{private} ? (private => 1) : ()),
+    ($view->{restricted} ? (restricted => 1) : ()),
+    ($view->{hidden} ? (hidden => 1) : ()),
     ($view->{tombstoned} ? (tombstoned => 1) : ()),
     supported_roles   => [ @{$view->{supported_roles} || []} ],
     members           => [
@@ -2090,6 +2153,8 @@ sub _authoritative_join_admission_is_populated {
   return 1 if exists $admission->{deleted};
   return 1 if exists $admission->{create_channel};
   return 1 if exists $admission->{auth_required};
+  return 1 if exists $admission->{request_join};
+  return 1 if exists $admission->{pending_request};
   return 1 if exists $admission->{reason};
   return 0;
 }
@@ -2311,6 +2376,9 @@ sub _authoritative_group_metadata_from_state {
     (ref($state->{invite_exception_masks}) eq 'ARRAY' && @{$state->{invite_exception_masks}} ? (invite_exception_masks => [ @{$state->{invite_exception_masks}} ]) : ()),
     (defined($state->{channel_key}) ? (channel_key => $state->{channel_key}) : ()),
     (defined($state->{user_limit}) ? (user_limit => $state->{user_limit}) : ()),
+    ($state->{private} ? (private => 1) : ()),
+    ($state->{restricted} ? (restricted => 1) : ()),
+    ($state->{hidden} ? (hidden => 1) : ()),
     tombstoned       => $state->{tombstoned} ? 1 : 0,
     (exists($state->{topic}) ? (topic => $state->{topic}) : ()),
   };
@@ -2504,6 +2572,8 @@ sub _authoritative_join_admission_for_client {
                   present => $present ? 1 : 0,
                   (defined $view->{admission}{invite_code} ? (invite_code => $view->{admission}{invite_code}) : ()),
                   (defined $view->{admission}{deleted} ? (deleted => $view->{admission}{deleted} ? 1 : 0) : ()),
+                  (defined $view->{admission}{request_join} ? (request_join => $view->{admission}{request_join} ? 1 : 0) : ()),
+                  (defined $view->{admission}{pending_request} ? (pending_request => $view->{admission}{pending_request} ? 1 : 0) : ()),
                   reason  => defined $view->{admission}{reason} ? $view->{admission}{reason} : '',
                 };
               } elsif (ref($view) eq 'HASH' && $view->{tombstoned}) {
@@ -2555,6 +2625,8 @@ sub _authoritative_join_admission_for_client {
     (defined $admission->{deleted} ? (deleted => $admission->{deleted} ? 1 : 0) : ()),
     (defined $admission->{create_channel} ? (create_channel => $admission->{create_channel} ? 1 : 0) : ()),
     (defined $admission->{auth_required} ? (auth_required => $admission->{auth_required} ? 1 : 0) : ()),
+    (defined $admission->{request_join} ? (request_join => $admission->{request_join} ? 1 : 0) : ()),
+    (defined $admission->{pending_request} ? (pending_request => $admission->{pending_request} ? 1 : 0) : ()),
     reason  => defined $admission->{reason} ? $admission->{reason} : '',
   };
 }
@@ -3354,6 +3426,68 @@ sub _handle_authoritative_invite_command {
   return 1;
 }
 
+sub _handle_authoritative_invites_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action => 'list_invites',
+  );
+  return $self->_send_no_such_channel($client_id, $channel)
+    if (($permission->{reason} || '') eq 'deleted');
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $permission->{allowed};
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  my $view = $self->_derive_authoritative_channel_view(
+    $channel,
+    force => 1,
+    (defined($actor_pubkey) ? (actor_pubkey => $actor_pubkey) : ()),
+  );
+
+  return $self->_send_authoritative_invite_list_reply(
+    $client_id,
+    $channel,
+    ref($view) eq 'HASH' ? ($view->{pending_invites} || []) : [],
+  );
+}
+
+sub _handle_authoritative_requests_command {
+  my ($self, %args) = @_;
+  my $client_id = $args{client_id};
+  my $channel = $args{channel};
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  my $permission = $self->_authoritative_channel_action_permission_for_client(
+    $channel,
+    $client,
+    action => 'list_requests',
+  );
+  return $self->_send_no_such_channel($client_id, $channel)
+    if (($permission->{reason} || '') eq 'deleted');
+  return $self->_send_chan_op_privs_needed($client_id, $channel)
+    unless $permission->{allowed};
+
+  my $actor_pubkey = $self->_client_authoritative_pubkey($client);
+  my $view = $self->_derive_authoritative_channel_view(
+    $channel,
+    force => 1,
+    (defined($actor_pubkey) ? (actor_pubkey => $actor_pubkey) : ()),
+  );
+
+  return $self->_send_authoritative_join_request_list_reply(
+    $client_id,
+    $channel,
+    ref($view) eq 'HASH' ? ($view->{pending_join_requests} || []) : [],
+  );
+}
+
 sub _nick_in_use {
   my ($self, $nick, %args) = @_;
   my $key = $self->_nick_key($nick);
@@ -4009,6 +4143,7 @@ sub _whois_entry_for_nick {
         ? $client->{realname}
         : $client->{nick}
     ),
+    (defined($client->{authority_pubkey}) ? (account => $client->{authority_pubkey}) : ()),
   };
 }
 
@@ -4052,7 +4187,7 @@ sub _who_entries_for_channel {
 }
 
 sub _list_entries {
-  my ($self, $target) = @_;
+  my ($self, $client, $target) = @_;
   $self->_refresh_authoritative_discovery_cache(refresh => 1)
     if $self->_authority_relay_enabled && $self->_authority_profile eq 'nip29';
 
@@ -4085,9 +4220,13 @@ sub _list_entries {
     my $state = $self->{channels}{$channel_key};
 
     if ($self->_is_authoritative_channel($channel)) {
+      my $actor_pubkey = ref($client) eq 'HASH'
+        ? $self->_client_authoritative_pubkey($client)
+        : undef;
       my $list_view = $self->_derive_authoritative_list_entry_view(
         $channel,
         force => 1,
+        (defined($actor_pubkey) ? (actor_pubkey => $actor_pubkey) : ()),
       );
       my $view = $self->_derive_authoritative_channel_view(
         $channel,
@@ -5381,6 +5520,7 @@ sub _send_client_line {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
+  $line = $self->_decorate_outbound_line_for_client($client, $line);
   my $payload = $line . "\r\n";
   my $offset = 0;
   while ($offset < length $payload) {
@@ -5400,6 +5540,46 @@ sub _send_client_line {
   }
 
   return 1;
+}
+
+sub _decorate_outbound_line_for_client {
+  my ($self, $client, $line) = @_;
+  return $line unless defined $line && !ref($line) && length($line);
+  return $line unless ref($client) eq 'HASH';
+  return $line if $line =~ /\A:\S+\s+CAP\s/;
+  return $line if $line =~ /\AAUTHENTICATE\s/;
+
+  my @tags;
+  push @tags, [ time => $self->_ircv3_server_time_tag ]
+    if $self->_client_has_capability($client, 'server-time');
+
+  return $line unless @tags
+    && (
+      $self->_client_has_capability($client, 'message-tags')
+        || $self->_client_has_capability($client, 'server-time')
+    );
+
+  my $tag_text = join ';', map { $_->[0] . '=' . $_->[1] } @tags;
+  if ($line =~ s/\A\@([^ ]+)\s+//) {
+    return '@' . $tag_text . ';' . $1 . ' ' . $line;
+  }
+
+  return '@' . $tag_text . ' ' . $line;
+}
+
+sub _ircv3_server_time_tag {
+  my ($self, $epoch) = @_;
+  $epoch = time() unless defined $epoch;
+  my ($sec, $min, $hour, $mday, $mon, $year) = gmtime($epoch);
+  return sprintf(
+    '%04d-%02d-%02dT%02d:%02d:%02d.000Z',
+    $year + 1900,
+    $mon + 1,
+    $mday,
+    $hour,
+    $min,
+    $sec,
+  );
 }
 
 sub _close_all_clients {
