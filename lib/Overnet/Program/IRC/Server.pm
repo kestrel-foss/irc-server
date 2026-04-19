@@ -9,9 +9,12 @@ use IO::Socket::INET;
 use IO::Socket::SSL ();
 use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
-use Overnet::Authority::Delegation;
 use Overnet::Authority::HostedChannel;
 use Overnet::Core::Nostr;
+use Overnet::Program::IRC::Authority::Coordinator;
+use Overnet::Program::IRC::Command::Auth;
+use Overnet::Program::IRC::Command::Channel;
+use Overnet::Program::IRC::Renderer;
 use Time::HiRes qw(time);
 use Overnet::Program::Protocol;
 use Overnet::Program::TLSConfig;
@@ -525,8 +528,11 @@ sub _handle_client_line {
   my @params = @{$message->{params} || []};
 
   if ($command eq 'CAP') {
-    $self->_handle_cap_command($client_id, \@params);
-    return 1;
+    return Overnet::Program::IRC::Command::Auth::handle_cap(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'NICK') {
@@ -610,7 +616,11 @@ sub _handle_client_line {
   }
 
   if ($command eq 'AUTHENTICATE') {
-    return $self->_handle_authenticate_command($client_id, \@params);
+    return Overnet::Program::IRC::Command::Auth::handle_authenticate(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'QUIT') {
@@ -675,184 +685,19 @@ sub _handle_client_line {
   }
 
   if ($command eq 'OVERNETAUTH') {
-    if (@params < 1 || !defined $params[0] || !length $params[0]) {
-      $self->_send_need_more_params($client_id, 'OVERNETAUTH');
-      return 1;
-    }
-
-    my $subcommand = uc($params[0]);
-    if ($subcommand eq 'CHALLENGE') {
-      my $challenge = $self->_generate_authoritative_auth_challenge($client);
-      $client->{authority_challenge} = $challenge;
-      $self->_send_server_notice($client_id, "OVERNETAUTH CHALLENGE $challenge");
-      return 1;
-    }
-
-    if ($subcommand eq 'AUTH') {
-      if (@params < 2 || !defined $params[1] || !length $params[1]) {
-        $self->_send_need_more_params($client_id, 'OVERNETAUTH');
-        return 1;
-      }
-
-      my $decoded = eval { decode_base64($params[1]) };
-      my $event_hash = eval { JSON::PP::decode_json($decoded) };
-      unless (ref($event_hash) eq 'HASH') {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH requires a base64-encoded event object');
-        return 1;
-      }
-
-      my $validation = $self->_validate_authoritative_auth_event(
-        challenge => $client->{authority_challenge},
-        event     => $event_hash,
-      );
-      unless ($validation->{valid}) {
-        my $reason = $validation->{reason} || '';
-        my $message = $reason =~ /kind 22242/i
-          ? 'OVERNETAUTH AUTH requires kind 22242'
-          : $reason =~ /challenge/i
-          ? 'OVERNETAUTH AUTH challenge does not match'
-          : $reason =~ /relay scope/i
-          ? 'OVERNETAUTH AUTH relay scope does not match'
-          : 'OVERNETAUTH AUTH requires a valid signed Nostr event';
-        $self->_send_server_notice($client_id, $message);
-        return 1;
-      }
-
-      $self->_apply_authoritative_auth_validation($client, $validation);
-      delete $client->{authority_challenge};
-      $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH ' . $client->{authority_pubkey});
-      return 1;
-    }
-
-    if ($subcommand eq 'DELEGATE') {
-      unless ($self->_authority_relay_enabled) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE requires authority_relay');
-        return 1;
-      }
-      unless (defined $client->{authority_pubkey} && !ref($client->{authority_pubkey}) && length($client->{authority_pubkey})) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE requires a prior AUTH');
-        return 1;
-      }
-
-      if (@params == 1) {
-        my $delegate = $self->_ensure_authoritative_delegate_offer($client);
-        $self->_send_server_notice(
-          $client_id,
-          join ' ',
-            'OVERNETAUTH DELEGATE',
-            $delegate->{delegate_pubkey},
-            $delegate->{session_id},
-            $delegate->{relay_url},
-            $delegate->{expires_at},
-        );
-        return 1;
-      }
-
-      my $delegate_key = $client->{authority_delegate_key};
-      my $delegate_session_id = $client->{authority_delegate_session_id};
-      my $delegate_expires_at = $client->{authority_delegate_expires_at};
-      unless (ref($delegate_key) eq 'Overnet::Core::Nostr::Key'
-          && defined $delegate_session_id
-          && !ref($delegate_session_id)
-          && length($delegate_session_id)
-          && defined $delegate_expires_at) {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE requires a prior parameter request');
-        return 1;
-      }
-
-      my $decoded = eval { decode_base64($params[1]) };
-      my $event_hash = eval { JSON::PP::decode_json($decoded) };
-      unless (ref($event_hash) eq 'HASH') {
-        $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE requires a base64-encoded event object');
-        return 1;
-      }
-
-      my $validation = $self->_accept_authoritative_delegate_event(
-        client          => $client,
-        event_hash      => $event_hash,
-        relay_url       => $self->_authority_relay_url,
-        session_id      => $delegate_session_id,
-        expires_at      => $delegate_expires_at,
-        delegate_pubkey => $delegate_key->pubkey_hex,
-        kind            => $self->_authority_grant_kind,
-      );
-      unless ($validation->{valid}) {
-        my $reason = $validation->{reason} || '';
-        my $message = $reason =~ /wrong event kind/i
-          ? 'OVERNETAUTH DELEGATE uses the wrong event kind'
-          : $reason =~ /authenticated user/i
-          ? 'OVERNETAUTH DELEGATE pubkey does not match the authenticated user'
-          : $reason =~ /relay does not match/i
-          ? 'OVERNETAUTH DELEGATE relay does not match'
-          : $reason =~ /server scope/i
-          ? 'OVERNETAUTH DELEGATE server scope does not match'
-          : $reason =~ /delegate pubkey/i
-          ? 'OVERNETAUTH DELEGATE delegate pubkey does not match'
-          : $reason =~ /session does not match/i
-          ? 'OVERNETAUTH DELEGATE session does not match'
-          : $reason =~ /expiration does not match/i
-          ? 'OVERNETAUTH DELEGATE expiration does not match'
-          : $reason =~ /relay publish failed/i
-          ? 'OVERNETAUTH DELEGATE relay publish failed'
-          : 'OVERNETAUTH DELEGATE requires a valid signed Nostr event';
-        $self->_send_server_notice($client_id, $message);
-        return 1;
-      }
-      $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE');
-      return 1;
-    }
-
-    $self->_send_unknown_command($client_id, 'OVERNETAUTH');
-    return 1;
+    return Overnet::Program::IRC::Command::Auth::handle_overnetauth(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'OVERNETCHANNEL') {
-    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
-      $self->_send_need_more_params($client_id, 'OVERNETCHANNEL');
-      return 1;
-    }
-
-    my $subcommand = uc($params[0]);
-    if ($subcommand eq 'DELETE') {
-      my $channel_input = $params[1];
-      unless ($self->_is_channel_name($channel_input)) {
-        $self->_send_no_such_channel($client_id, $channel_input);
-        return 1;
-      }
-
-      my $channel = $self->_canonical_channel_name($channel_input);
-      unless ($self->_is_authoritative_channel($channel)) {
-        $self->_send_no_such_channel($client_id, $channel_input);
-        return 1;
-      }
-
-      return $self->_handle_authoritative_delete_command(
-        client_id => $client_id,
-        channel   => $channel,
-      );
-    }
-
-    if ($subcommand eq 'UNDELETE') {
-      my $channel_input = $params[1];
-      unless ($self->_is_channel_name($channel_input)) {
-        $self->_send_no_such_channel($client_id, $channel_input);
-        return 1;
-      }
-
-      my $channel = $self->_canonical_channel_name($channel_input);
-      unless ($self->_is_authoritative_channel($channel)) {
-        $self->_send_no_such_channel($client_id, $channel_input);
-        return 1;
-      }
-
-      return $self->_handle_authoritative_undelete_command(
-        client_id => $client_id,
-        channel   => $channel,
-      );
-    }
-
-    $self->_send_unknown_command($client_id, 'OVERNETCHANNEL');
-    return 1;
+    return Overnet::Program::IRC::Command::Channel::handle_overnetchannel(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'USERHOST') {
@@ -916,226 +761,35 @@ sub _handle_client_line {
   }
 
   if ($command eq 'MODE') {
-    if (@params < 1 || !defined $params[0] || !length $params[0]) {
-      $self->_send_need_more_params($client_id, 'MODE');
-      return 1;
-    }
-    my $target = $params[0];
-    if ($self->_is_nick_name($target)) {
-      my $current_nick = $client->{nick};
-      if (defined $current_nick
-          && defined $self->_nick_key($current_nick)
-          && defined $self->_nick_key($target)
-          && $self->_nick_key($current_nick) eq $self->_nick_key($target)) {
-        $self->_send_user_mode_is($client_id);
-        return 1;
-      }
-    }
-
-    if (!$self->_is_channel_name($target)) {
-      $self->_send_no_such_channel($client_id, $target);
-      return 1;
-    }
-
-    my $channel = $self->_client_joined_channel_name($client, $target);
-    unless (defined $channel) {
-      $self->_send_not_on_channel($client_id, $target);
-      return 1;
-    }
-
-    if ($self->_is_authoritative_channel($channel)) {
-      if (@params >= 2 && defined $params[1] && length $params[1]) {
-        return $self->_handle_authoritative_mode_command(
-          client_id => $client_id,
-          channel   => $channel,
-          params    => \@params,
-        );
-      }
-    }
-
-    $self->_send_channel_mode_is($client_id, $channel);
-    return 1;
+    return Overnet::Program::IRC::Command::Channel::handle_mode(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'KICK') {
-    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
-      $self->_send_need_more_params($client_id, 'KICK');
-      return 1;
-    }
-    my $channel_input = $params[0];
-    if (!$self->_is_channel_name($channel_input)) {
-      $self->_send_no_such_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    my $channel = $self->_client_joined_channel_name($client, $channel_input);
-    unless (defined $channel) {
-      $self->_send_not_on_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    if ($self->_is_authoritative_channel($channel)) {
-      return $self->_handle_authoritative_kick_command(
-        client_id => $client_id,
-        channel   => $channel,
-        params    => \@params,
-      );
-    }
-
-    $self->_send_unknown_command($client_id, 'KICK');
-    return 1;
+    return Overnet::Program::IRC::Command::Channel::handle_kick(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'INVITE') {
-    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1] || !length $params[1]) {
-      $self->_send_need_more_params($client_id, 'INVITE');
-      return 1;
-    }
-
-    my $target_nick = $params[0];
-    my $channel_input = $params[1];
-    if (!$self->_is_channel_name($channel_input)) {
-      $self->_send_no_such_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    my $channel = $self->_client_joined_channel_name($client, $channel_input);
-    unless (defined $channel) {
-      $self->_send_not_on_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    if ($self->_is_authoritative_channel($channel)) {
-      return $self->_handle_authoritative_invite_command(
-        client_id   => $client_id,
-        channel     => $channel,
-        target_nick => $target_nick,
-      );
-    }
-
-    $self->_send_unknown_command($client_id, 'INVITE');
-    return 1;
+    return Overnet::Program::IRC::Command::Channel::handle_invite(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   if ($command eq 'JOIN') {
-    if (@params < 1 || !defined $params[0] || !length $params[0]) {
-      $self->_send_need_more_params($client_id, 'JOIN');
-      return 1;
-    }
-    my $channel_input = $params[0];
-    if (!$self->_is_channel_name($channel_input)) {
-      $self->_send_no_such_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    my $channel = $self->_canonical_channel_name($channel_input);
-    my $already_joined = $self->_client_joined_channel_name($client, $channel_input);
-    my $authoritative_join;
-
-    if ($self->_is_authoritative_channel($channel)) {
-      $authoritative_join = $self->_authoritative_join_admission_for_client($channel, $client);
-      if (defined $already_joined) {
-        if ($authoritative_join->{allowed} && $authoritative_join->{present}) {
-          return 1;
-        }
-        $self->_remove_client_from_channel(
-          $client_id,
-          $channel,
-          nick => $client->{nick},
-        );
-        $already_joined = undef;
-      }
-      unless ($authoritative_join->{allowed}) {
-        if ($authoritative_join->{auth_required}) {
-          $self->_send_server_notice($client_id, 'OVERNETAUTH AUTH is required for authoritative JOIN');
-          return 1;
-        }
-        if ($authoritative_join->{deleted}) {
-          $self->_send_no_such_channel($client_id, $channel);
-          return 1;
-        }
-        $self->_send_cannot_join_channel(
-          $client_id,
-          $channel,
-          reason => $authoritative_join->{reason},
-        );
-        return 1;
-      }
-
-      if ($self->_authority_relay_enabled) {
-        my $needs_authoritative_join_write = $authoritative_join->{create_channel}
-          || defined($authoritative_join->{invite_code})
-          || !$authoritative_join->{member}
-          || !$authoritative_join->{present};
-        if ($needs_authoritative_join_write && !$self->_client_has_authoritative_delegation($client)) {
-          $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative JOIN');
-          return 1;
-        }
-        if ($needs_authoritative_join_write) {
-          unless ($self->_publish_authoritative_input(
-              $client,
-              {
-                command        => 'JOIN',
-                target         => $channel,
-                actor_pubkey   => $self->_client_authoritative_pubkey($client),
-                actor_mask     => $self->_authoritative_irc_mask_for_client($client),
-                (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
-                ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
-                ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
-              },
-            )) {
-            $self->_send_server_notice(
-              $client_id,
-              $self->{authoritative_publish_error} || 'authoritative relay publish failed',
-            );
-            return 1;
-          }
-        }
-      } else {
-        my $needs_authoritative_join_emit = $authoritative_join->{create_channel}
-          || defined($authoritative_join->{invite_code})
-          || !$authoritative_join->{member}
-          || !$authoritative_join->{present};
-        if ($needs_authoritative_join_emit) {
-          return 1 unless $self->_emit_client_input(
-            $client,
-            {
-              command      => 'JOIN',
-              target       => $channel,
-              actor_pubkey => $self->_client_authoritative_pubkey($client),
-              actor_mask   => $self->_authoritative_irc_mask_for_client($client),
-              (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
-              ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
-              ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
-            },
-          );
-        }
-      }
-    }
-    elsif (defined $already_joined) {
-      return 1;
-    }
-
-    $self->_add_client_to_channel($client_id, $channel);
-    $self->_broadcast_channel_line(
-      $channel,
-      sprintf(':%s JOIN %s', $client->{nick}, $channel),
+    return Overnet::Program::IRC::Command::Channel::handle_join(
+      $self,
+      $client_id,
+      \@params,
     );
-    $self->_send_join_bootstrap($client_id, $channel);
-    $self->_ensure_channel_subscription($channel);
-    if (!$self->_is_authoritative_channel($channel)) {
-      $self->_emit_client_input(
-        $client,
-        {
-          command => 'JOIN',
-          target  => $channel,
-        },
-        suppress_render_event_types => {
-          'chat.join' => 1,
-        },
-      );
-    }
-    return 1;
   }
 
   if ($command eq 'NAMES') {
@@ -1155,177 +809,28 @@ sub _handle_client_line {
   }
 
   if ($command eq 'PART') {
-    if (@params < 1 || !defined $params[0] || !length $params[0]) {
-      $self->_send_need_more_params($client_id, 'PART');
-      return 1;
-    }
-    my $channel_input = $params[0];
-    if (!$self->_is_channel_name($channel_input)) {
-      $self->_send_no_such_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    my $channel = $self->_client_joined_channel_name($client, $channel_input);
-    unless (defined $channel) {
-      $self->_send_not_on_channel($client_id, $channel_input);
-      return 1;
-    }
-
-    my $reason = @params >= 2 ? $params[1] : undef;
-    if ($self->_is_authoritative_channel($channel)) {
-      return $self->_handle_authoritative_part_command(
-        client_id => $client_id,
-        channel   => $channel,
-        reason    => $reason,
-      );
-    }
-
-    my $line = sprintf(':%s PART %s', $client->{nick}, $channel);
-    $line .= ' :' . $reason
-      if defined $reason && length $reason;
-    $self->_broadcast_channel_line($channel, $line);
-    $self->_remove_client_from_channel($client_id, $channel);
-    $self->_emit_client_input(
-      $client,
-      {
-        command => 'PART',
-        target  => $channel,
-        (defined $reason ? (text => $reason) : ()),
-      },
-      suppress_render_event_types => {
-        'chat.part' => 1,
-      },
+    return Overnet::Program::IRC::Command::Channel::handle_part(
+      $self,
+      $client_id,
+      \@params,
     );
-    return 1;
   }
 
   if ($command eq 'PRIVMSG' || $command eq 'NOTICE') {
-    if (@params < 2 || !defined $params[0] || !length $params[0] || !defined $params[1]) {
-      $self->_send_need_more_params($client_id, $command);
-      return 1;
-    }
-    my $target = $params[0];
-
-    if ($self->_is_channel_name($target)) {
-      my $channel = $self->_client_joined_channel_name($client, $target);
-      unless (defined $channel) {
-        $self->_send_not_on_channel($client_id, $target);
-        return 1;
-      }
-
-      if ($self->_is_authoritative_channel($channel)) {
-        my $permission = $self->_authoritative_speak_permission_for_client($channel, $client);
-        unless ($permission->{allowed}) {
-          $self->_send_cannot_send_to_channel($client_id, $channel);
-          return 1;
-        }
-      } elsif ($self->_channel_is_moderated_for_client($channel, $client)) {
-        $self->_send_cannot_send_to_channel($client_id, $channel);
-        return 1;
-      }
-
-      $self->_emit_client_input(
-        $client,
-        {
-          command => $command,
-          target  => $channel,
-          text    => $params[1],
-        },
-      );
-      return 1;
-    }
-
-    if (!$self->_is_nick_name($target)) {
-      $self->_send_no_such_nick($client_id, $target);
-      return 1;
-    }
-
-    my $target_nick = $self->_canonical_current_nick($target);
-    unless (defined $target_nick) {
-      $self->_send_no_such_nick($client_id, $target);
-      return 1;
-    }
-
-    my ($e2ee_transport, $e2ee_error, $is_e2ee) = $self->_decode_e2ee_dm_body($params[1]);
-    if ($is_e2ee) {
-      if (!defined $e2ee_transport) {
-        $self->_send_server_notice($client_id, $e2ee_error);
-        return 1;
-      }
-
-      $self->_emit_opaque_private_message_transport(
-        client       => $client,
-        command      => $command,
-        target_nick  => $target_nick,
-        body_text    => $params[1],
-        transport    => $e2ee_transport,
-      );
-      return 1;
-    }
-
-    $self->_emit_client_input(
-      $client,
-      {
-        command => $command,
-        target  => $target_nick,
-        text    => $params[1],
-      },
+    return Overnet::Program::IRC::Command::Channel::handle_privmsg_or_notice(
+      $self,
+      $client_id,
+      $command,
+      \@params,
     );
-    return 1;
   }
 
   if ($command eq 'TOPIC') {
-    if (@params < 1 || !defined $params[0] || !length $params[0]) {
-      $self->_send_need_more_params($client_id, 'TOPIC');
-      return 1;
-    }
-    my $target = $params[0];
-    if (!$self->_is_channel_name($target)) {
-      $self->_send_no_such_channel($client_id, $target);
-      return 1;
-    }
-    my $channel = $self->_client_joined_channel_name($client, $target);
-    unless (defined $channel) {
-      $self->_send_not_on_channel($client_id, $target);
-      return 1;
-    }
-
-    if (@params == 1) {
-      $self->_send_topic_reply($client_id, $channel);
-      return 1;
-    }
-
-    if ($self->_is_authoritative_channel($channel)) {
-      my $permission = $self->_authoritative_topic_permission_for_client($channel, $client);
-      unless ($permission->{allowed}) {
-        if (($permission->{reason} || '') eq 'deleted') {
-          $self->_send_no_such_channel($client_id, $channel);
-        } else {
-          $self->_send_chan_op_privs_needed($client_id, $channel);
-        }
-        return 1;
-      }
-      return $self->_handle_authoritative_topic_command(
-        client_id => $client_id,
-        channel   => $channel,
-        text      => $params[1],
-      );
-    }
-
-    if ($self->_channel_is_topic_restricted_for_client($channel, $client)) {
-      $self->_send_chan_op_privs_needed($client_id, $channel);
-      return 1;
-    }
-
-    $self->_emit_client_input(
-      $client,
-      {
-        command => $command,
-        target  => $channel,
-        text    => $params[1],
-      },
+    return Overnet::Program::IRC::Command::Channel::handle_topic(
+      $self,
+      $client_id,
+      \@params,
     );
-    return 1;
   }
 
   if ($command eq 'LUSERS') {
@@ -1334,9 +839,11 @@ sub _handle_client_line {
   }
 
   if ($command eq 'LIST') {
-    my $target = @params ? $params[0] : undef;
-    $self->_send_list_reply($client_id, $target);
-    return 1;
+    return Overnet::Program::IRC::Command::Channel::handle_list(
+      $self,
+      $client_id,
+      \@params,
+    );
   }
 
   $self->_send_unknown_command($client_id, $command);
@@ -1358,243 +865,24 @@ sub _register_client_if_ready {
   return 1;
 }
 
-sub _handle_cap_command {
-  my ($self, $client_id, $params) = @_;
-  my @params = @{$params || []};
-  my $subcommand = defined $params[0] ? uc($params[0]) : '';
-  my $client = $self->{clients}{$client_id}
-    or return 0;
-  my @supported = $self->_supported_capabilities;
-
-  if ($subcommand eq 'LS') {
-    $client->{cap_negotiation_active} = 1 if !$client->{registered};
-    return $self->_send_client_line(
-      $client_id,
-      sprintf(':%s CAP * LS :%s', $self->{config}{server_name}, join(' ', @supported)),
-    );
-  }
-
-  if ($subcommand eq 'REQ') {
-    if (@params < 2 || !defined $params[1] || !length $params[1]) {
-      $self->_send_need_more_params($client_id, 'CAP');
-      return 1;
-    }
-    $client->{cap_negotiation_active} = 1 if !$client->{registered};
-
-    my @requested = grep { defined($_) && length($_) } split /\s+/, $params[1];
-    my %supported = map { $_ => 1 } @supported;
-    if (@requested && !grep { !$supported{$_} } @requested) {
-      $client->{capabilities}{$_} = 1 for @requested;
-      return $self->_send_client_line(
-        $client_id,
-        sprintf(':%s CAP * ACK :%s', $self->{config}{server_name}, join(' ', @requested)),
-      );
-    }
-
-    return $self->_send_client_line(
-      $client_id,
-      sprintf(':%s CAP * NAK :%s', $self->{config}{server_name}, $params[1]),
-    );
-  }
-
-  if ($subcommand eq 'END') {
-    $client->{cap_negotiation_active} = 0;
-    $self->_register_client_if_ready($client);
-    return 1;
-  }
-
-  $self->_send_unknown_command($client_id, 'CAP');
-  return 1;
-}
-
-sub _handle_authenticate_command {
-  my ($self, $client_id, $params) = @_;
-  my @params = @{$params || []};
-  my $client = $self->{clients}{$client_id}
-    or return 0;
-
-  if (!@params || !defined($params[0]) || !length($params[0])) {
-    $self->_send_need_more_params($client_id, 'AUTHENTICATE');
-    return 1;
-  }
-
-  my $argument = $params[0];
-  if (!defined($client->{sasl_mechanism}) || !length($client->{sasl_mechanism})) {
-    unless ($self->_client_has_capability($client, 'sasl')) {
-      $self->_send_sasl_fail($client_id);
-      return 1;
-    }
-
-    my $mechanism = uc $argument;
-    unless ($mechanism eq 'NOSTR' && $self->_authority_profile eq 'nip29') {
-      $self->_send_sasl_fail($client_id);
-      return 1;
-    }
-
-    my $challenge_payload = $self->_start_sasl_nostr_exchange($client);
-    unless (ref($challenge_payload) eq 'HASH') {
-      $self->_send_sasl_fail($client_id);
-      return 1;
-    }
-
-    my $payload = encode_base64(JSON::PP::encode_json($challenge_payload), '');
-    $self->_send_authenticate_payload($client_id, $payload);
-    return 1;
-  }
-
-  if ($argument eq '*') {
-    $self->_reset_sasl_state($client);
-    $self->_send_sasl_fail($client_id);
-    return 1;
-  }
-
-  if ($argument eq '+') {
-    return $self->_complete_sasl_exchange($client_id);
-  }
-
-  $client->{sasl_buffer} .= $argument;
-  return 1 if length($argument) == 400;
-  return $self->_complete_sasl_exchange($client_id);
-}
-
-sub _start_sasl_nostr_exchange {
-  my ($self, $client) = @_;
-  return undef unless ref($client) eq 'HASH';
-
-  my $challenge = $self->_generate_authoritative_auth_challenge($client);
-  my %payload = (
-    challenge => $challenge,
-    scope     => $self->_authoritative_auth_scope,
-  );
-
-  if ($self->_authority_relay_enabled) {
-    my $delegate = $self->_ensure_authoritative_delegate_offer($client);
-    return undef unless ref($delegate) eq 'HASH';
-    @payload{qw(relay_url grant_kind delegate_pubkey session_id expires_at)} = (
-      $delegate->{relay_url},
-      $delegate->{grant_kind},
-      $delegate->{delegate_pubkey},
-      $delegate->{session_id},
-      $delegate->{expires_at},
-    );
-  }
-
-  $client->{authority_challenge} = $challenge;
-  $client->{sasl_mechanism} = 'NOSTR';
-  $client->{sasl_buffer} = '';
-  $client->{sasl_challenge_payload} = \%payload;
-  return \%payload;
-}
-
-sub _complete_sasl_exchange {
-  my ($self, $client_id) = @_;
-  my $client = $self->{clients}{$client_id}
-    or return 0;
-
-  my $decoded = eval { decode_base64($client->{sasl_buffer} || '') };
-  my $payload = eval { JSON::PP::decode_json($decoded) };
-  unless (ref($payload) eq 'HASH') {
-    $self->_reset_sasl_state($client);
-    $self->_send_sasl_fail($client_id);
-    return 1;
-  }
-
-  my $challenge_payload = ref($client->{sasl_challenge_payload}) eq 'HASH'
-    ? $client->{sasl_challenge_payload}
-    : {};
-  my $delegate_offer = $self->_authority_relay_enabled
-    ? {
-        key        => $client->{authority_delegate_key},
-        session_id => $challenge_payload->{session_id},
-        expires_at => $challenge_payload->{expires_at},
-      }
-    : undef;
-  my $auth_validation = $self->_validate_authoritative_auth_event(
-    challenge => $challenge_payload->{challenge},
-    event     => $payload->{auth_event},
-  );
-  unless ($auth_validation->{valid}) {
-    $self->_reset_sasl_state($client);
-    $self->_send_sasl_fail($client_id);
-    return 1;
-  }
-
-  $self->_apply_authoritative_auth_validation($client, $auth_validation);
-  if ($self->_authority_relay_enabled) {
-    if (ref($delegate_offer) eq 'HASH') {
-      $client->{authority_delegate_key} = $delegate_offer->{key}
-        if ref($delegate_offer->{key}) eq 'Overnet::Core::Nostr::Key';
-      $client->{authority_delegate_session_id} = $delegate_offer->{session_id}
-        if defined $delegate_offer->{session_id};
-      $client->{authority_delegate_expires_at} = $delegate_offer->{expires_at}
-        if defined $delegate_offer->{expires_at};
-    }
-    unless (ref($payload->{delegate_event}) eq 'HASH') {
-      $self->_clear_authoritative_binding($client);
-      $self->_reset_sasl_state($client);
-      $self->_send_sasl_fail($client_id);
-      return 1;
-    }
-    my $delegate_result = $self->_accept_authoritative_delegate_event(
-      client     => $client,
-      event_hash => $payload->{delegate_event},
-      relay_url  => $challenge_payload->{relay_url},
-      session_id => $challenge_payload->{session_id},
-      expires_at => $challenge_payload->{expires_at},
-      delegate_pubkey => $challenge_payload->{delegate_pubkey},
-      kind       => $challenge_payload->{grant_kind},
-    );
-    unless ($delegate_result->{valid}) {
-      $self->_clear_authoritative_binding($client);
-      $self->_reset_sasl_state($client);
-      $self->_send_sasl_fail($client_id);
-      return 1;
-    }
-  }
-
-  $self->_reset_sasl_state($client);
-  $self->_send_sasl_success($client_id);
-  $self->_register_client_if_ready($client);
-  return 1;
-}
-
-sub _reset_sasl_state {
-  my ($self, $client) = @_;
-  return 0 unless ref($client) eq 'HASH';
-  delete $client->{sasl_mechanism};
-  $client->{sasl_buffer} = '';
-  delete $client->{sasl_challenge_payload};
-  delete $client->{authority_challenge};
-  return 1;
-}
-
 sub _send_authenticate_payload {
   my ($self, $client_id, $payload) = @_;
-  my $remaining = defined($payload) ? $payload : '';
-  my $sent = 0;
-
-  while (length($remaining) > 400) {
-    $self->_send_client_line($client_id, 'AUTHENTICATE ' . substr($remaining, 0, 400, ''));
-    $sent = 1;
-  }
-
-  if (length $remaining) {
-    return $self->_send_client_line($client_id, 'AUTHENTICATE ' . $remaining);
-  }
-
-  return $self->_send_client_line($client_id, $sent ? 'AUTHENTICATE +' : 'AUTHENTICATE +');
+  return $self->_send_rendered_lines(
+    $client_id,
+    Overnet::Program::IRC::Renderer::authenticate_payload_lines(
+      payload => $payload,
+    ),
+  );
 }
 
 sub _send_sasl_success {
   my ($self, $client_id) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 903 %s :SASL authentication successful',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::sasl_success_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
     ),
   );
 }
@@ -1603,123 +891,12 @@ sub _send_sasl_fail {
   my ($self, $client_id) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 904 %s :SASL authentication failed',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::sasl_fail_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
     ),
   );
-}
-
-sub _validate_authoritative_auth_event {
-  my ($self, %args) = @_;
-  my $challenge = $args{challenge};
-  return {
-    valid  => 0,
-    reason => 'auth event challenge does not match',
-  } unless defined $challenge && !ref($challenge) && length($challenge);
-
-  return Overnet::Authority::Delegation->verify_auth_event(
-    challenge => $challenge,
-    scope     => $self->_authoritative_auth_scope,
-    event     => $args{event},
-  );
-}
-
-sub _apply_authoritative_auth_validation {
-  my ($self, $client, $validation) = @_;
-  return 0 unless ref($client) eq 'HASH';
-  return 0 unless ref($validation) eq 'HASH' && $validation->{valid};
-
-  $self->_clear_authoritative_binding($client);
-  $client->{authority_pubkey} = $validation->{pubkey};
-  return 1;
-}
-
-sub _clear_authoritative_binding {
-  my ($self, $client) = @_;
-  return 0 unless ref($client) eq 'HASH';
-  delete $client->{authority_pubkey};
-  delete $client->{authority_delegate_key};
-  delete $client->{authority_delegate_session_id};
-  delete $client->{authority_delegate_expires_at};
-  delete $client->{authority_delegate_event_id};
-  delete $client->{authority_delegate_sequence};
-  delete $self->{authoritative_last_created_at}{$client->{id}};
-  delete $self->{authoritative_delegate_sequences}{$client->{id}};
-  return 1;
-}
-
-sub _ensure_authoritative_delegate_offer {
-  my ($self, $client) = @_;
-  return undef unless ref($client) eq 'HASH';
-
-  if (!ref($client->{authority_delegate_key}) || ref($client->{authority_delegate_key}) ne 'Overnet::Core::Nostr::Key') {
-    $client->{authority_delegate_key} = Overnet::Core::Nostr->generate_key;
-  }
-  if (!defined $client->{authority_delegate_session_id}
-      || ref($client->{authority_delegate_session_id})
-      || !length($client->{authority_delegate_session_id})) {
-    $client->{authority_delegate_session_id} = $self->_generate_authoritative_delegate_session_id($client);
-  }
-  $client->{authority_delegate_expires_at} = int(time()) + 3600;
-
-  return {
-    relay_url       => $self->_authority_relay_url,
-    grant_kind      => $self->_authority_grant_kind,
-    delegate_pubkey => $client->{authority_delegate_key}->pubkey_hex,
-    session_id      => $client->{authority_delegate_session_id},
-    expires_at      => $client->{authority_delegate_expires_at},
-  };
-}
-
-sub _accept_authoritative_delegate_event {
-  my ($self, %args) = @_;
-  my $client = $args{client};
-  return {
-    valid  => 0,
-    reason => 'delegation event pubkey does not match the authenticated user',
-  } unless ref($client) eq 'HASH'
-    && defined $client->{authority_pubkey}
-    && !ref($client->{authority_pubkey})
-    && $client->{authority_pubkey} =~ /\A[0-9a-f]{64}\z/;
-
-  my $validation = Overnet::Authority::Delegation->verify_delegation_grant(
-    authority_pubkey => $client->{authority_pubkey},
-    relay_url        => $args{relay_url},
-    scope            => $self->_authoritative_auth_scope,
-    delegate_pubkey  => $args{delegate_pubkey},
-    session_id       => $args{session_id},
-    expires_at       => $args{expires_at},
-    kind             => $args{kind},
-    event            => $args{event_hash},
-  );
-  return $validation unless $validation->{valid};
-
-  my $publish = eval {
-    $self->_request(
-      method => 'nostr.publish_event',
-      params => {
-        relay_url => $args{relay_url},
-        event     => $validation->{event},
-      },
-    );
-  };
-  if ($@ || ref($publish) ne 'HASH' || !$publish->{accepted}) {
-    return {
-      valid  => 0,
-      reason => 'delegation relay publish failed',
-    };
-  }
-
-  $client->{authority_delegate_event_id} = $validation->{event_id};
-  $client->{authority_delegate_sequence} = 0;
-  $self->{authoritative_last_created_at}{$client->{id}} = 0;
-  $self->{authoritative_delegate_sequences}{$client->{id}} = 0;
-  $self->_read_authoritative_grant_events(force => 1);
-  return $validation;
 }
 
 sub _command_requires_registration {
@@ -1727,18 +904,30 @@ sub _command_requires_registration {
   return scalar grep { $_ eq ($command || '') } qw(JOIN PART PRIVMSG NOTICE TOPIC NAMES MODE KICK INVITE USERHOST WHO WHOIS LUSERS LIST OVERNETKEY OVERNETAUTH OVERNETCHANNEL);
 }
 
+sub _send_rendered_lines {
+  my ($self, $client_id, $lines) = @_;
+  return 0 unless ref($lines) eq 'ARRAY';
+
+  my $sent = 0;
+  for my $line (@{$lines}) {
+    next unless defined $line && !ref($line);
+    $self->_send_client_line($client_id, $line);
+    $sent = 1;
+  }
+
+  return $sent ? 1 : 0;
+}
+
 sub _send_unknown_command {
   my ($self, $client_id, $command) = @_;
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 421 %s %s :Unknown command',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $command,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::unknown_command_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      command     => $command,
     ),
   );
 }
@@ -1748,33 +937,14 @@ sub _send_registration_prelude {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 001 %s :Welcome to Overnet IRC',
-      $self->{config}{server_name},
-      $client->{nick},
+    Overnet::Program::IRC::Renderer::registration_prelude_lines(
+      server_name     => $self->{config}{server_name},
+      nick            => $client->{nick},
+      isupport_tokens => $self->_isupport_tokens,
     ),
   );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 005 %s %s :are supported by this server',
-      $self->{config}{server_name},
-      $client->{nick},
-      $self->_isupport_tokens,
-    ),
-  );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 422 %s :MOTD File is missing',
-      $self->{config}{server_name},
-      $client->{nick},
-    ),
-  );
-
-  return 1;
 }
 
 sub _send_nonickname_given {
@@ -1782,23 +952,19 @@ sub _send_nonickname_given {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 431 %s :No nickname given',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::nonickname_given_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
     ),
   );
 }
 
 sub _send_not_registered {
   my ($self, $client_id) = @_;
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 451 * :You have not registered',
-      $self->{config}{server_name},
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::not_registered_line(
+      server_name => $self->{config}{server_name},
     ),
   );
 }
@@ -1808,13 +974,11 @@ sub _send_need_more_params {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 461 %s %s :Not enough parameters',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $command,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::need_more_params_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      command     => $command,
     ),
   );
 }
@@ -1825,13 +989,11 @@ sub _send_server_notice {
     or return 0;
   return 0 unless defined $client->{nick} && length($client->{nick});
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s NOTICE %s :%s',
-      $self->{config}{server_name},
-      $client->{nick},
-      $text,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::server_notice_line(
+      server_name => $self->{config}{server_name},
+      nick        => $client->{nick},
+      text        => $text,
     ),
   );
 }
@@ -1841,13 +1003,11 @@ sub _send_no_such_nick {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 401 %s %s :No such nick/channel',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $nick,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::no_such_nick_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      target_nick => $nick,
     ),
   );
 }
@@ -1857,13 +1017,11 @@ sub _send_no_such_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 403 %s %s :No such channel',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::no_such_channel_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
     ),
   );
 }
@@ -1873,13 +1031,11 @@ sub _send_not_on_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 442 %s %s :You\'re not on that channel',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::not_on_channel_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
     ),
   );
 }
@@ -1889,13 +1045,11 @@ sub _send_cannot_send_to_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 404 %s %s :Cannot send to channel',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::cannot_send_to_channel_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
     ),
   );
 }
@@ -1905,13 +1059,11 @@ sub _send_chan_op_privs_needed {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 482 %s %s :You\'re not channel operator',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::chan_op_privs_needed_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
     ),
   );
 }
@@ -1921,22 +1073,12 @@ sub _send_cannot_join_channel {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  my $numeric = defined($args{reason}) && !ref($args{reason}) && $args{reason} eq '+b'
-    ? 474
-    : 473;
-  my $reason = 'Cannot join channel';
-  $reason .= ' (' . $args{reason} . ')'
-    if defined $args{reason} && !ref($args{reason}) && length($args{reason});
-
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s %d %s %s :%s',
-      $self->{config}{server_name},
-      $numeric,
-      $self->_client_numeric_target($client),
-      $channel,
-      $reason,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::cannot_join_channel_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
+      reason      => $args{reason},
     ),
   );
 }
@@ -1946,15 +1088,12 @@ sub _send_ban_list_entry {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 367 %s %s %s %s 0',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
-      $ban_mask,
-      $self->{config}{server_name},
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::ban_list_entry_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
+      ban_mask    => $ban_mask,
     ),
   );
 }
@@ -1964,13 +1103,11 @@ sub _send_end_of_ban_list {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 368 %s %s :End of channel ban list',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::end_of_ban_list_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
     ),
   );
 }
@@ -1980,14 +1117,12 @@ sub _send_inviting {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 341 %s %s %s',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $target_nick,
-      $channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::inviting_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      target_nick => $target_nick,
+      channel     => $channel,
     ),
   );
 }
@@ -2007,14 +1142,12 @@ sub _send_channel_mode_is {
         && length($authoritative->{channel_modes});
   }
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 324 %s %s %s',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $display_channel,
-      $channel_modes,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::channel_mode_is_line(
+      server_name   => $self->{config}{server_name},
+      nick          => $self->_client_numeric_target($client),
+      channel       => $display_channel,
+      channel_modes => $channel_modes,
     ),
   );
 }
@@ -2024,12 +1157,10 @@ sub _send_user_mode_is {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 221 %s +',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::user_mode_is_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
     ),
   );
 }
@@ -2043,47 +1174,14 @@ sub _send_lusers_reply {
   my $connected_clients = scalar keys %{$self->{clients}};
   my $channels = scalar keys %{$self->{channels}};
 
-  $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 251 %s :There are %d users and 0 services on 1 server',
-      $self->{config}{server_name},
-      $target,
-      $registered_users,
-    ),
-  );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 252 %s 0 :operator(s) online',
-      $self->{config}{server_name},
-      $target,
-    ),
-  );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 253 %s 0 :unknown connection(s)',
-      $self->{config}{server_name},
-      $target,
-    ),
-  );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 254 %s %d :channels formed',
-      $self->{config}{server_name},
-      $target,
-      $channels,
-    ),
-  );
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 255 %s :I have %d clients and 1 server',
-      $self->{config}{server_name},
-      $target,
-      $connected_clients,
+    Overnet::Program::IRC::Renderer::lusers_reply_lines(
+      server_name      => $self->{config}{server_name},
+      nick             => $target,
+      registered_users => $registered_users,
+      connected_clients => $connected_clients,
+      channels         => $channels,
     ),
   );
 }
@@ -2094,35 +1192,12 @@ sub _send_list_reply {
     or return 0;
   my $nick = $self->_client_numeric_target($client);
 
-  $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 321 %s Channel :Users Name',
-      $self->{config}{server_name},
-      $nick,
-    ),
-  );
-
-  for my $entry ($self->_list_entries($target)) {
-    $self->_send_client_line(
-      $client_id,
-      sprintf(
-        ':%s 322 %s %s %d :%s',
-        $self->{config}{server_name},
-        $nick,
-        $entry->{channel},
-        $entry->{visible_users},
-        $entry->{topic},
-      ),
-    );
-  }
-
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 323 %s :End of /LIST',
-      $self->{config}{server_name},
-      $nick,
+    Overnet::Program::IRC::Renderer::list_reply_lines(
+      server_name => $self->{config}{server_name},
+      nick        => $nick,
+      entries     => [ $self->_list_entries($target) ],
     ),
   );
 }
@@ -2144,25 +1219,21 @@ sub _send_topic_reply {
       unless ref($view) eq 'HASH';
     $self->_sync_authoritative_topic_state_from_view($display_channel, $view);
     if (ref($view) eq 'HASH' && exists $view->{topic}) {
-      return $self->_send_client_line(
-        $client_id,
-        sprintf(
-          ':%s 332 %s %s :%s',
-          $self->{config}{server_name},
-          $target,
-          $display_channel,
-          $view->{topic},
+      return $self->_send_client_line($client_id,
+        Overnet::Program::IRC::Renderer::topic_is_line(
+          server_name => $self->{config}{server_name},
+          nick        => $target,
+          channel     => $display_channel,
+          topic       => $view->{topic},
         ),
       );
     }
 
-    return $self->_send_client_line(
-      $client_id,
-      sprintf(
-        ':%s 331 %s %s :No topic is set',
-        $self->{config}{server_name},
-        $target,
-        $display_channel,
+    return $self->_send_client_line($client_id,
+      Overnet::Program::IRC::Renderer::no_topic_line(
+        server_name => $self->{config}{server_name},
+        nick        => $target,
+        channel     => $display_channel,
       ),
     );
   }
@@ -2171,25 +1242,21 @@ sub _send_topic_reply {
     || $self->_channel_state($display_channel);
 
   if (defined $state->{topic_text} && !ref($state->{topic_text})) {
-    return $self->_send_client_line(
-      $client_id,
-      sprintf(
-        ':%s 332 %s %s :%s',
-        $self->{config}{server_name},
-        $target,
-        $display_channel,
-        $state->{topic_text},
+    return $self->_send_client_line($client_id,
+      Overnet::Program::IRC::Renderer::topic_is_line(
+        server_name => $self->{config}{server_name},
+        nick        => $target,
+        channel     => $display_channel,
+        topic       => $state->{topic_text},
       ),
     );
   }
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 331 %s %s :No topic is set',
-      $self->{config}{server_name},
-      $target,
-      $display_channel,
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::no_topic_line(
+      server_name => $self->{config}{server_name},
+      nick        => $target,
+      channel     => $display_channel,
     ),
   );
 }
@@ -2199,13 +1266,11 @@ sub _send_userhost_reply {
   my $client = $self->{clients}{$client_id}
     or return 0;
 
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 302 %s :%s',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      join(' ', @{$entries || []}),
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::userhost_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      entries     => $entries,
     ),
   );
 }
@@ -2217,30 +1282,13 @@ sub _send_who_list {
   my $display_channel = $self->_canonical_channel_name($channel);
   return 0 unless defined $display_channel;
 
-  for my $entry ($self->_who_entries_for_channel($display_channel)) {
-    $self->_send_client_line(
-      $client_id,
-      sprintf(
-        ':%s 352 %s %s %s %s %s %s H :0 %s',
-        $self->{config}{server_name},
-        $self->_client_numeric_target($client),
-        $display_channel,
-        $entry->{username},
-        $entry->{host},
-        $self->{config}{server_name},
-        $entry->{nick},
-        $entry->{realname},
-      ),
-    );
-  }
-
-  return $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 315 %s %s :End of /WHO list.',
-      $self->{config}{server_name},
-      $self->_client_numeric_target($client),
-      $display_channel,
+    Overnet::Program::IRC::Renderer::who_list_lines(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $display_channel,
+      entries     => [ $self->_who_entries_for_channel($display_channel) ],
     ),
   );
 }
@@ -2257,36 +1305,18 @@ sub _send_whois_reply {
   my $host = $entry->{host};
   my $realname = $entry->{realname};
 
-  $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 311 %s %s %s %s * :%s',
-      $self->{config}{server_name},
-      $target,
-      $display_nick,
-      $username,
-      $host,
-      $realname,
-    ),
-  );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 312 %s %s %s :%s',
-      $self->{config}{server_name},
-      $target,
-      $display_nick,
-      $self->{config}{server_name},
-      $self->_server_description,
-    ),
-  );
-  return $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 318 %s %s :End of /WHOIS list.',
-      $self->{config}{server_name},
-      $target,
-      $display_nick,
+    Overnet::Program::IRC::Renderer::whois_reply_lines(
+      server_name        => $self->{config}{server_name},
+      nick               => $target,
+      server_description => $self->_server_description,
+      entry              => {
+        nick     => $display_nick,
+        username => $username,
+        host     => $host,
+        realname => $realname,
+      },
     ),
   );
 }
@@ -2533,371 +1563,82 @@ sub _authoritative_channels {
 
 sub _authoritative_grant_subscription_id {
   my ($self) = @_;
-  return 'irc.authority.grants:' . $self->{config}{network};
+  return Overnet::Program::IRC::Authority::Coordinator::authoritative_grant_subscription_id($self);
 }
 
 sub _authoritative_discovery_subscription_id {
   my ($self) = @_;
-  return 'irc.authority.discovery:' . $self->{config}{network};
+  return Overnet::Program::IRC::Authority::Coordinator::authoritative_discovery_subscription_id($self);
 }
 
 sub _authoritative_channel_subscription_ids {
   my ($self, $channel) = @_;
-  my ($group_host, $group_id) = $self->_authoritative_group_binding($channel);
-  return ()
-    unless defined $group_host && defined $group_id;
-  return (
-    join(':', 'irc.authority.meta', $self->{config}{network}, $group_host, $group_id),
-    join(':', 'irc.authority.control', $self->{config}{network}, $group_host, $group_id),
-  );
+  return Overnet::Program::IRC::Authority::Coordinator::authoritative_channel_subscription_ids($self, $channel);
 }
 
 sub _ensure_authoritative_grant_subscription {
   my ($self) = @_;
-  return undef unless $self->_authority_relay_enabled;
-
-  my $subscription_id = $self->{authoritative_grant_subscription_id}
-    || $self->_authoritative_grant_subscription_id;
-  return $subscription_id
-    if $self->{authoritative_grant_subscription_id};
-
-  $self->_request(
-    method => 'nostr.open_subscription',
-    params => {
-      subscription_id => $subscription_id,
-      relay_url       => $self->_authority_relay_url,
-      timeout_ms      => $self->_authority_relay_query_timeout_ms,
-      filters         => [
-        {
-          kinds => [ $self->_authority_grant_kind ],
-          limit => 200,
-        },
-      ],
-    },
-  );
-  $self->{authoritative_grant_subscription_id} = $subscription_id;
-  return $subscription_id;
+  return Overnet::Program::IRC::Authority::Coordinator::ensure_authoritative_grant_subscription($self);
 }
 
 sub _ensure_authoritative_discovery_subscription {
   my ($self) = @_;
-  return undef unless $self->_authority_relay_enabled;
-  return undef unless $self->_authority_profile eq 'nip29';
-
-  my $subscription_id = $self->{authoritative_discovery_subscription_id}
-    || $self->_authoritative_discovery_subscription_id;
-  return $subscription_id
-    if $self->{authoritative_discovery_subscription_id};
-
-  $self->_request(
-    method => 'nostr.open_subscription',
-    params => {
-      subscription_id => $subscription_id,
-      relay_url       => $self->_authority_relay_url,
-      timeout_ms      => $self->_authority_relay_query_timeout_ms,
-      filters         => [
-        {
-          kinds => [ 39000, 9002 ],
-          limit => 1_000,
-        },
-      ],
-    },
-  );
-  $self->{authoritative_discovery_subscription_id} = $subscription_id;
-  return $subscription_id;
+  return Overnet::Program::IRC::Authority::Coordinator::ensure_authoritative_discovery_subscription($self);
 }
 
 sub _ensure_authoritative_channel_subscription {
   my ($self, $channel) = @_;
-  return undef unless $self->_authority_relay_enabled;
-  return undef unless $self->_is_authoritative_channel($channel);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return undef unless defined $canonical;
-  my (undef, $group_id) = $self->_authoritative_group_binding($canonical);
-  return undef unless defined $group_id;
-
-  my @subscription_specs = (
-    [
-      ($self->_authoritative_channel_subscription_ids($canonical))[0],
-      [
-        {
-          kinds => [ 39000, 39001, 39002, 39003 ],
-          '#d'  => [ $group_id ],
-          limit => 200,
-        },
-      ],
-    ],
-    [
-      ($self->_authoritative_channel_subscription_ids($canonical))[1],
-      [
-        {
-          kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
-          '#h'  => [ $group_id ],
-          limit => 200,
-        },
-      ],
-    ],
-  );
-
-  my @subscription_ids;
-  for my $spec (@subscription_specs) {
-    my ($subscription_id, $filters) = @{$spec};
-    next unless defined $subscription_id;
-    if (!$self->{authoritative_subscription_channels}{$subscription_id}) {
-      $self->_request(
-        method => 'nostr.open_subscription',
-        params => {
-          subscription_id => $subscription_id,
-          relay_url       => $self->_authority_relay_url,
-          timeout_ms      => $self->_authority_relay_query_timeout_ms,
-          filters         => $filters,
-        },
-      );
-      $self->{authoritative_subscription_channels}{$subscription_id} = $canonical;
-    }
-    push @subscription_ids, $subscription_id;
-  }
-
-  return \@subscription_ids;
+  return Overnet::Program::IRC::Authority::Coordinator::ensure_authoritative_channel_subscription($self, $channel);
 }
 
 sub _read_nostr_subscription_snapshot {
   my ($self, $subscription_id, %args) = @_;
-  return [] unless defined $subscription_id && !ref($subscription_id) && length($subscription_id);
-
-  my $result = eval {
-    $self->_request(
-      method => 'nostr.read_subscription_snapshot',
-      params => {
-        subscription_id => $subscription_id,
-        (defined $args{refresh} ? (refresh => $args{refresh} ? 1 : 0) : ()),
-      },
-    );
-  };
-  return [] if $@;
-  return [] unless ref($result->{events}) eq 'ARRAY';
-  return [ @{$result->{events}} ];
+  return Overnet::Program::IRC::Authority::Coordinator::read_nostr_subscription_snapshot($self, $subscription_id, %args);
 }
 
 sub _remember_authoritative_discovered_channel {
   my ($self, %args) = @_;
-  my $channel = $args{channel};
-  my $group_id = $args{group_id};
-  return 0 unless $self->_is_channel_name($channel);
-  return 0 unless defined $group_id && !ref($group_id) && length($group_id);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return 0 unless defined $canonical;
-
-  $self->{authoritative_discovered_channels}{$canonical} = {
-    channel_name => $channel,
-    group_id     => $group_id,
-    discovered_at => time(),
-  };
-  return 1;
+  return Overnet::Program::IRC::Authority::Coordinator::remember_authoritative_discovered_channel($self, %args);
 }
 
 sub _forget_authoritative_discovered_channel {
   my ($self, $channel) = @_;
-  my $canonical = $self->_canonical_channel_name($channel);
-  return 0 unless defined $canonical;
-
-  delete $self->{authoritative_discovered_channels}{$canonical};
-  return 1;
+  return Overnet::Program::IRC::Authority::Coordinator::forget_authoritative_discovered_channel($self, $channel);
 }
 
 sub _record_authoritative_discovery_event {
   my ($self, $event) = @_;
-  return 0 unless ref($event) eq 'HASH';
-  my $channel = Overnet::Authority::HostedChannel::channel_name_from_group_event(
-    network => $self->{config}{network},
-    event   => $event,
-  );
-  return 0 unless defined $channel;
-
-  my %tags = $self->_first_tag_values($event->{tags});
-  my $group_id = $tags{d} || $tags{h};
-  if (Overnet::Authority::HostedChannel::group_event_is_tombstoned(event => $event)) {
-    return $self->_forget_authoritative_discovered_channel($channel);
-  }
-  return $self->_remember_authoritative_discovered_channel(
-    channel  => $channel,
-    group_id => $group_id,
-  );
+  return Overnet::Program::IRC::Authority::Coordinator::record_authoritative_discovery_event($self, $event);
 }
 
 sub _refresh_authoritative_discovery_cache {
   my ($self, %args) = @_;
-  return 0 unless $self->_authority_relay_enabled;
-  return 0 unless $self->_authority_profile eq 'nip29';
-
-  my $subscription_id = $self->_ensure_authoritative_discovery_subscription;
-  return 0 unless defined $subscription_id;
-
-  my $events = $self->_read_nostr_subscription_snapshot(
-    $subscription_id,
-    ($args{refresh} ? (refresh => 1) : ()),
-  );
-  $events = $self->_sort_authoritative_events($events);
-  my $count = 0;
-  for my $event (@{$events || []}) {
-    $count += $self->_record_authoritative_discovery_event($event) || 0;
-  }
-  return $count;
+  return Overnet::Program::IRC::Authority::Coordinator::refresh_authoritative_discovery_cache($self, %args);
 }
 
 sub _query_nostr_events {
   my ($self, %args) = @_;
-  my $relay_url = $args{relay_url};
-  my $filters = $args{filters};
-  return [] unless defined $relay_url && !ref($relay_url) && length($relay_url);
-  return [] unless ref($filters) eq 'ARRAY' && @{$filters};
-
-  my $result = eval {
-    $self->_request(
-      method => 'nostr.query_events',
-      params => {
-        relay_url => $relay_url,
-        filters   => $filters,
-        (defined $args{timeout_ms} ? (timeout_ms => $args{timeout_ms}) : ()),
-      },
-    );
-  };
-  return [] if $@;
-  return [] unless ref($result->{events}) eq 'ARRAY';
-  return [ @{$result->{events}} ];
+  return Overnet::Program::IRC::Authority::Coordinator::query_nostr_events($self, %args);
 }
 
 sub _read_authoritative_nip29_events_from_runtime {
   my ($self, $channel) = @_;
-  my $stream = $self->_authoritative_nip29_stream_name($channel);
-  return [] unless defined $stream;
-
-  my $result = eval {
-    $self->_request(
-      method => 'events.read',
-      params => {
-        stream => $stream,
-      },
-    );
-  };
-  return [] if $@;
-  return [] unless ref($result->{entries}) eq 'ARRAY';
-
-  return [
-    map { $_->{event} }
-    grep { ref($_) eq 'HASH' && ref($_->{event}) eq 'HASH' }
-    @{$result->{entries}}
-  ];
+  return Overnet::Program::IRC::Authority::Coordinator::read_authoritative_nip29_events_from_runtime($self, $channel);
 }
 
 sub _load_authoritative_nip29_events {
   my ($self, $channel, %args) = @_;
-  return [] unless $self->_is_authoritative_channel($channel);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return [] unless defined $canonical;
-
-  if ($self->_authority_relay_enabled) {
-    my $subscription_ids = $self->_ensure_authoritative_channel_subscription($canonical);
-    return [] unless ref($subscription_ids) eq 'ARRAY' && @{$subscription_ids};
-
-    if ($args{refresh}) {
-      my (undef, $group_id) = $self->_authoritative_group_binding($canonical);
-      return [] unless defined $group_id;
-
-      my @events;
-      my %seen_ids;
-      for my $filters (
-        [
-          {
-            kinds => [ 39000, 39001, 39002, 39003 ],
-            '#d'  => [ $group_id ],
-            limit => 200,
-          },
-        ],
-        [
-          {
-            kinds => [ 9000, 9001, 9002, 9009, 9021, 9022 ],
-            '#h'  => [ $group_id ],
-            limit => 200,
-          },
-        ],
-      ) {
-        my $queried = $self->_query_nostr_events(
-          relay_url => $self->_authority_relay_url,
-          filters   => $filters,
-          timeout_ms => $self->_authority_relay_query_timeout_ms,
-        );
-        for my $event (@{$queried || []}) {
-          next unless ref($event) eq 'HASH';
-          next if defined($event->{id}) && $seen_ids{$event->{id}}++;
-          push @events, $event;
-        }
-      }
-
-      return \@events;
-    }
-
-    my @events;
-    my %seen_ids;
-    for my $subscription_id (@{$subscription_ids}) {
-      my $subscription_events = $self->_read_nostr_subscription_snapshot($subscription_id);
-      for my $event (@{$subscription_events || []}) {
-        next unless ref($event) eq 'HASH';
-        next if defined($event->{id}) && $seen_ids{$event->{id}}++;
-        push @events, $event;
-      }
-    }
-    return \@events;
-  }
-
-  return $self->_read_authoritative_nip29_events_from_runtime($canonical);
+  return Overnet::Program::IRC::Authority::Coordinator::load_authoritative_nip29_events($self, $channel, %args);
 }
 
 sub _refresh_authoritative_nip29_channel_cache {
   my ($self, $channel, %args) = @_;
-  return [] unless $self->_is_authoritative_channel($channel);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return [] unless defined $canonical;
-
-  my $cache = ($self->{authoritative_channel_cache}{$canonical} ||= {});
-  my $events = $self->_load_authoritative_nip29_events(
-    $canonical,
-    (defined $args{refresh} ? (refresh => $args{refresh}) : ()),
-  );
-  my $view = $self->_derive_authoritative_channel_view_from_events($canonical, $events);
-  $cache->{events} = $events;
-  $cache->{view} = $view;
-  $cache->{state} = $self->_authoritative_channel_state_from_view($view);
-  $cache->{refreshed_at} = time();
-  $self->_sync_authoritative_topic_state_from_view($canonical, $view);
-
-  return $events;
+  return Overnet::Program::IRC::Authority::Coordinator::refresh_authoritative_nip29_channel_cache($self, $channel, %args);
 }
 
 sub _read_authoritative_nip29_events {
   my ($self, $channel, %args) = @_;
-  return [] unless $self->_is_authoritative_channel($channel);
-
-  my $canonical = $self->_canonical_channel_name($channel);
-  return [] unless defined $canonical;
-
-  my $cache = $self->{authoritative_channel_cache}{$canonical};
-  my $refresh = $args{force} || !$cache || ref($cache->{events}) ne 'ARRAY';
-  if ($refresh) {
-    $self->_refresh_authoritative_nip29_channel_cache(
-      $canonical,
-      ($self->_authority_relay_enabled ? (refresh => 1) : ()),
-    );
-    $cache = $self->{authoritative_channel_cache}{$canonical};
-  }
-
-  return $cache && ref($cache->{events}) eq 'ARRAY'
-    ? [ @{$cache->{events}} ]
-    : [];
+  return Overnet::Program::IRC::Authority::Coordinator::read_authoritative_nip29_events($self, $channel, %args);
 }
 
 sub _authoritative_channel_is_known {
@@ -3317,27 +2058,7 @@ sub _sort_authoritative_events {
 
 sub _read_authoritative_grant_events {
   my ($self, %args) = @_;
-  return [] unless $self->_authority_relay_enabled;
-
-  my $cache = $self->{authoritative_grant_cache};
-  if (!$args{force} && $cache && ref($cache->{events}) eq 'ARRAY') {
-    return [ @{$cache->{events}} ];
-  }
-
-  my $subscription_id = $self->_ensure_authoritative_grant_subscription;
-  my $events = $self->_read_nostr_subscription_snapshot(
-    $subscription_id,
-    ($args{force} ? (refresh => 1) : ()),
-  );
-  $events = $self->_sort_authoritative_events($events);
-
-  $self->{authoritative_grant_cache} = {
-    events         => $events,
-    refreshed_at   => time(),
-    nick_by_pubkey => undef,
-  };
-
-  return [ @{$events} ];
+  return Overnet::Program::IRC::Authority::Coordinator::read_authoritative_grant_events($self, %args);
 }
 
 sub _client_authoritative_pubkey {
@@ -4548,13 +3269,11 @@ sub _send_nick_in_use {
   my $target = $client->{registered} && defined $client->{nick} && length($client->{nick})
     ? $client->{nick}
     : '*';
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 433 %s %s :Nickname is already in use',
-      $self->{config}{server_name},
-      $target,
-      $attempted_nick,
+  $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::nick_in_use_line(
+      server_name    => $self->{config}{server_name},
+      nick           => $target,
+      attempted_nick => $attempted_nick,
     ),
   );
   return 1;
@@ -4707,81 +3426,12 @@ sub _next_authoritative_created_at {
 
 sub _publish_authoritative_nip29_event {
   my ($self, %args) = @_;
-  my $channel = $args{channel};
-  my $client = $args{client};
-  my $event = $args{event};
-  return 0 unless $self->_is_authoritative_channel($channel);
-  return 0 unless ref($event) eq 'HASH';
-
-  if ($self->_authority_relay_enabled) {
-    return 0 unless $self->_client_has_authoritative_delegation($client);
-    my $signed = eval {
-      $client->{authority_delegate_key}->sign_event_hash(
-        event => $event,
-      );
-    };
-    if ($@) {
-      $self->{authoritative_publish_error} = 'authoritative relay signing failed';
-      return 0;
-    }
-    unless (ref($signed) eq 'HASH' || ref($signed) eq 'Overnet::Core::Nostr::Event') {
-      $self->{authoritative_publish_error} = 'authoritative relay signing returned an invalid event';
-      return 0;
-    }
-
-    my $event_hash = ref($signed) eq 'HASH'
-      ? $signed
-      : $signed->to_hash;
-    my $publish = eval {
-      $self->_request(
-        method => 'nostr.publish_event',
-        params => {
-          relay_url => $self->_authority_relay_url,
-          event     => $event_hash,
-        },
-      );
-    };
-    if ($@) {
-      $self->{authoritative_publish_error} = 'authoritative relay publish failed';
-      return 0;
-    }
-    unless (ref($publish) eq 'HASH' && $publish->{accepted}) {
-      $self->{authoritative_publish_error} = ref($publish) eq 'HASH' && defined $publish->{message} && length($publish->{message})
-        ? 'authoritative relay rejected event: ' . $publish->{message}
-        : 'authoritative relay rejected event';
-      return 0;
-    }
-
-    $self->{suppress_subscription_event_ids}{$publish->{event_id}} = 1
-      if defined $publish->{event_id} && !ref($publish->{event_id}) && length($publish->{event_id});
-    $self->_update_authoritative_channel_cache_with_event(
-      channel         => $channel,
-      event           => $event_hash,
-      suppress_render => 1,
-    );
-    return 1;
-  }
-
-  return 0 unless $self->_append_authoritative_nip29_event($channel, $event);
-  $self->_refresh_authoritative_nip29_channel_cache($channel);
-  return 1;
+  return Overnet::Program::IRC::Authority::Coordinator::publish_authoritative_nip29_event($self, %args);
 }
 
 sub _append_authoritative_nip29_event {
   my ($self, $channel, $event) = @_;
-  return 0 unless ref($event) eq 'HASH';
-
-  my $stream = $self->_authoritative_nip29_stream_name($channel);
-  return 0 unless defined $stream;
-
-  $self->_request(
-    method => 'events.append',
-    params => {
-      stream => $stream,
-      event  => $event,
-    },
-  );
-  return 1;
+  return Overnet::Program::IRC::Authority::Coordinator::append_authoritative_nip29_event($self, $channel, $event);
 }
 
 sub _is_authoritative_nip29_event {
@@ -5578,59 +4228,12 @@ sub _disconnect_client {
 
 sub _handle_subscription_event {
   my ($self, $params) = @_;
-  return 0 unless ref($params) eq 'HASH';
-  if (($params->{item_type} || '') eq 'nostr.event') {
-    return $self->_handle_nostr_subscription_event($params);
-  }
-  return 0 unless ($params->{item_type} || '') eq 'event'
-    || ($params->{item_type} || '') eq 'state'
-    || ($params->{item_type} || '') eq 'private_message';
-  return 0 unless ref($params->{data}) eq 'HASH';
-
-  my $data = $params->{data};
-  if (defined $data->{id} && delete $self->{suppress_subscription_event_ids}{$data->{id}}) {
-    return 0;
-  }
-
-  my $render = $self->_render_subscription_item(
-    item_type => $params->{item_type},
-    data      => $data,
-  );
-  return 0 unless $render;
-
-  for my $client_id (@{$render->{client_ids}}) {
-    $self->_send_client_line($client_id, $render->{line});
-  }
-
-  return scalar @{$render->{client_ids}};
+  return Overnet::Program::IRC::Authority::Coordinator::handle_subscription_event($self, $params);
 }
 
 sub _handle_nostr_subscription_event {
   my ($self, $params) = @_;
-  return 0 unless ref($params->{data}) eq 'HASH';
-
-  my $subscription_id = $params->{subscription_id};
-  return 0 unless defined $subscription_id && !ref($subscription_id) && length($subscription_id);
-
-  if (defined $params->{data}{id} && delete $self->{suppress_subscription_event_ids}{$params->{data}{id}}) {
-    return 0;
-  }
-
-  if (($subscription_id || '') eq ($self->{authoritative_grant_subscription_id} || '')) {
-    $self->_read_authoritative_grant_events(force => 1);
-    return 1;
-  }
-
-  if (($subscription_id || '') eq ($self->{authoritative_discovery_subscription_id} || '')) {
-    return $self->_record_authoritative_discovery_event($params->{data});
-  }
-
-  my $channel = $self->{authoritative_subscription_channels}{$subscription_id};
-  return 0 unless defined $channel;
-  return $self->_update_authoritative_channel_cache_with_event(
-    channel => $channel,
-    event   => $params->{data},
-  );
+  return Overnet::Program::IRC::Authority::Coordinator::handle_nostr_subscription_event($self, $params);
 }
 
 sub _render_subscription_item {
@@ -6477,27 +5080,15 @@ sub _send_names_list {
     }
   }
 
-  $self->_send_client_line(
+  return $self->_send_rendered_lines(
     $client_id,
-    sprintf(
-      ':%s 353 %s = %s :%s',
-      $self->{config}{server_name},
-      $client->{nick},
-      $display_channel,
-      join(' ', @nicks),
+    Overnet::Program::IRC::Renderer::names_list_lines(
+      server_name => $self->{config}{server_name},
+      nick        => $client->{nick},
+      channel     => $display_channel,
+      names       => \@nicks,
     ),
   );
-  $self->_send_client_line(
-    $client_id,
-    sprintf(
-      ':%s 366 %s %s :End of /NAMES list.',
-      $self->{config}{server_name},
-      $client->{nick},
-      $display_channel,
-    ),
-  );
-
-  return 1;
 }
 
 sub _send_join_bootstrap {
