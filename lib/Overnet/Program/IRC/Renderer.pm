@@ -110,6 +110,20 @@ sub server_notice_line {
   );
 }
 
+sub account_notify_line {
+  my (%args) = @_;
+  my $account = defined($args{account}) && !ref($args{account}) && length($args{account})
+    ? $args{account}
+    : '*';
+  return sprintf(
+    ':%s!%s@%s ACCOUNT %s',
+    $args{nick},
+    $args{username},
+    $args{host},
+    $account,
+  );
+}
+
 sub no_such_nick_line {
   my (%args) = @_;
   return sprintf(

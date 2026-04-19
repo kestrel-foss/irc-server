@@ -1486,8 +1486,9 @@ sub _isupport_tokens {
 sub _supported_capabilities {
   my ($self) = @_;
   my @capabilities = ('message-tags', 'server-time', 'overnet-e2ee');
-  push @capabilities, 'sasl'
-    if $self->_authority_profile eq 'nip29';
+  if ($self->_authority_profile eq 'nip29') {
+    push @capabilities, 'account-tag', 'account-notify', 'sasl';
+  }
   return @capabilities;
 }
 
@@ -1530,6 +1531,13 @@ sub _client_has_capability {
   return 0 unless ref($client) eq 'HASH';
   return 0 unless defined $capability && !ref($capability) && length($capability);
   return $client->{capabilities}{$capability} ? 1 : 0;
+}
+
+sub _client_account_name {
+  my ($self, $client) = @_;
+  return undef unless ref($client) eq 'HASH';
+  return undef unless defined($client->{authority_pubkey}) && !ref($client->{authority_pubkey}) && length($client->{authority_pubkey});
+  return $client->{authority_pubkey};
 }
 
 sub _authority_profile {
@@ -5549,9 +5557,20 @@ sub _decorate_outbound_line_for_client {
   return $line if $line =~ /\A:\S+\s+CAP\s/;
   return $line if $line =~ /\AAUTHENTICATE\s/;
 
+  my @existing_tags;
+  if ($line =~ s/\A\@([^ ]+)\s+//) {
+    @existing_tags = grep { defined($_) && length($_) } split /;/, $1;
+  }
+
   my @tags;
   push @tags, [ time => $self->_ircv3_server_time_tag ]
     if $self->_client_has_capability($client, 'server-time');
+  if ($self->_client_has_capability($client, 'message-tags')
+      && $self->_client_has_capability($client, 'account-tag')) {
+    my $account = $self->_outbound_account_tag_for_line($line);
+    push @tags, [ account => $account ]
+      if defined($account) && !ref($account) && length($account);
+  }
 
   return $line unless @tags
     && (
@@ -5559,12 +5578,30 @@ sub _decorate_outbound_line_for_client {
         || $self->_client_has_capability($client, 'server-time')
     );
 
-  my $tag_text = join ';', map { $_->[0] . '=' . $_->[1] } @tags;
-  if ($line =~ s/\A\@([^ ]+)\s+//) {
-    return '@' . $tag_text . ';' . $1 . ' ' . $line;
-  }
+  my %seen = map {
+    my ($name) = split /=/, $_, 2;
+    ($name => 1);
+  } @existing_tags;
+  my @merged = map { $_->[0] . '=' . $_->[1] }
+    grep { !$seen{$_->[0]}++ } @tags;
+  push @merged, @existing_tags;
 
-  return '@' . $tag_text . ' ' . $line;
+  return $line unless @merged;
+  return '@' . join(';', @merged) . ' ' . $line;
+}
+
+sub _outbound_account_tag_for_line {
+  my ($self, $line) = @_;
+  return undef unless defined $line && !ref($line) && length($line);
+  return undef unless $line =~ /\A:([^ ]+)\s/;
+
+  my $prefix = $1;
+  my ($nick) = split /[!@]/, $prefix, 2;
+  return undef unless defined $nick && !ref($nick) && length($nick);
+
+  my $sender = $self->_client_for_current_nick($nick);
+  return undef unless ref($sender) eq 'HASH';
+  return $self->_client_account_name($sender);
 }
 
 sub _ircv3_server_time_tag {

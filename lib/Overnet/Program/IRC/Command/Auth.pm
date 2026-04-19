@@ -6,6 +6,7 @@ use JSON::PP ();
 use MIME::Base64 qw(decode_base64 encode_base64);
 use Overnet::Authority::Delegation;
 use Overnet::Core::Nostr;
+use Overnet::Program::IRC::Renderer ();
 
 our $VERSION = '0.001';
 
@@ -37,7 +38,8 @@ sub handle_cap {
     if (@requested && !grep { !$supported{$_} } @requested) {
       $client->{capabilities}{$_} = 1 for @requested;
       $client->{capabilities}{'message-tags'} = 1
-        if $client->{capabilities}{'server-time'};
+        if $client->{capabilities}{'server-time'}
+          || $client->{capabilities}{'account-tag'};
       return $server->_send_client_line(
         $client_id,
         sprintf(':%s CAP * ACK :%s', $server->{config}{server_name}, join(' ', @requested)),
@@ -382,22 +384,95 @@ sub apply_authoritative_auth_validation {
   return 0 unless ref($client) eq 'HASH';
   return 0 unless ref($validation) eq 'HASH' && $validation->{valid};
 
-  clear_authoritative_binding($server, $client);
-  $client->{authority_pubkey} = $validation->{pubkey};
-  return 1;
+  return set_authoritative_account(
+    $server,
+    $client,
+    account => $validation->{pubkey},
+  );
 }
 
 sub clear_authoritative_binding {
   my ($server, $client) = @_;
   return 0 unless ref($client) eq 'HASH';
-  delete $client->{authority_pubkey};
+  return set_authoritative_account($server, $client);
+}
+
+sub set_authoritative_account {
+  my ($server, $client, %args) = @_;
+  return 0 unless ref($client) eq 'HASH';
+
+  my $old_account = _normalized_account($client->{authority_pubkey});
+  my $new_account = _normalized_account($args{account});
+  return 1
+    if defined($old_account) && defined($new_account) && $old_account eq $new_account;
+  return 1
+    if !defined($old_account) && !defined($new_account);
+
+  _send_account_notify($server, $client, $new_account)
+    if ref($server);
+
+  _clear_authoritative_delegate_state($server, $client);
+  if (defined $new_account) {
+    $client->{authority_pubkey} = $new_account;
+  } else {
+    delete $client->{authority_pubkey};
+  }
+
+  return 1;
+}
+
+sub _normalized_account {
+  my ($account) = @_;
+  return undef unless defined($account) && !ref($account) && length($account);
+  return $account;
+}
+
+sub _send_account_notify {
+  my ($server, $client, $new_account) = @_;
+  return 1 unless ref($server) && ref($client) eq 'HASH';
+  return 1 unless $client->{registered};
+  return 1 unless defined($client->{nick}) && !ref($client->{nick}) && length($client->{nick});
+
+  my %recipient_ids;
+  for my $recipient_id ($server->_shared_client_ids_for_client($client->{id})) {
+    next unless defined($recipient_id) && exists $server->{clients}{$recipient_id};
+    my $recipient = $server->{clients}{$recipient_id};
+    next unless ref($recipient) eq 'HASH' && $recipient->{registered};
+    next unless $server->_client_has_capability($recipient, 'account-notify');
+    $recipient_ids{$recipient_id} = 1;
+  }
+  return 1 unless %recipient_ids;
+
+  my $line = Overnet::Program::IRC::Renderer::account_notify_line(
+    nick     => $client->{nick},
+    username => (
+      defined($client->{username}) && !ref($client->{username}) && length($client->{username})
+        ? $client->{username}
+        : $client->{nick}
+    ),
+    host    => $server->_presentational_host_for_client($client),
+    account => $new_account,
+  );
+
+  for my $recipient_id (sort { $a <=> $b } keys %recipient_ids) {
+    $server->_send_client_line($recipient_id, $line);
+  }
+
+  return 1;
+}
+
+sub _clear_authoritative_delegate_state {
+  my ($server, $client) = @_;
+  return 0 unless ref($client) eq 'HASH';
   delete $client->{authority_delegate_key};
   delete $client->{authority_delegate_session_id};
   delete $client->{authority_delegate_expires_at};
   delete $client->{authority_delegate_event_id};
   delete $client->{authority_delegate_sequence};
-  delete $server->{authoritative_last_created_at}{$client->{id}};
-  delete $server->{authoritative_delegate_sequences}{$client->{id}};
+  if (ref($server)) {
+    delete $server->{authoritative_last_created_at}{$client->{id}};
+    delete $server->{authoritative_delegate_sequences}{$client->{id}};
+  }
   return 1;
 }
 
