@@ -6,6 +6,89 @@ use Overnet::Authority::HostedChannel;
 
 our $VERSION = '0.001';
 
+sub _event_id {
+  my ($event) = @_;
+  return undef unless ref($event) eq 'HASH';
+  return undef unless defined($event->{id}) && !ref($event->{id}) && length($event->{id});
+  return $event->{id};
+}
+
+sub _merge_authoritative_events {
+  my ($server, @lists) = @_;
+  my @events;
+  my %seen_ids;
+
+  for my $list (@lists) {
+    next unless ref($list) eq 'ARRAY';
+    for my $event (@{$list}) {
+      next unless ref($event) eq 'HASH';
+      my $event_id = _event_id($event);
+      next if defined($event_id) && $seen_ids{$event_id}++;
+      push @events, $event;
+    }
+  }
+
+  return $server->_sort_authoritative_events(\@events);
+}
+
+sub _all_authoritative_discovery_events {
+  my ($server) = @_;
+  my @events;
+
+  for my $events (values %{$server->{authoritative_discovery_event_cache} || {}}) {
+    next unless ref($events) eq 'ARRAY';
+    push @events, @{$events};
+  }
+
+  return \@events;
+}
+
+sub _set_authoritative_discovery_events {
+  my ($server, $events) = @_;
+  my %by_channel;
+
+  for my $event (@{$server->_sort_authoritative_events($events || []) || []}) {
+    next unless ref($event) eq 'HASH';
+    my $channel = Overnet::Authority::HostedChannel::channel_name_from_group_event(
+      network => $server->{config}{network},
+      event   => $event,
+    );
+    next unless defined $channel;
+    my $canonical = $server->_canonical_channel_name($channel);
+    next unless defined $canonical;
+    push @{$by_channel{$canonical}}, $event;
+  }
+
+  $server->{authoritative_discovery_event_cache} = {};
+  $server->{authoritative_discovered_channels} = {};
+
+  for my $canonical (sort keys %by_channel) {
+    my $sorted = $server->_sort_authoritative_events($by_channel{$canonical});
+    $server->{authoritative_discovery_event_cache}{$canonical} = $sorted;
+
+    my $active;
+    for my $event (@{$sorted}) {
+      my %tags = $server->_first_tag_values($event->{tags});
+      my $group_id = $tags{d} || $tags{h};
+      next unless defined $group_id && !ref($group_id) && length($group_id);
+      if (Overnet::Authority::HostedChannel::group_event_is_tombstoned(event => $event)) {
+        $active = undef;
+        next;
+      }
+      $active = {
+        channel_name  => $canonical,
+        group_id      => $group_id,
+        discovered_at => time(),
+      };
+    }
+
+    $server->{authoritative_discovered_channels}{$canonical} = $active
+      if ref($active) eq 'HASH';
+  }
+
+  return scalar keys %{$server->{authoritative_discovered_channels} || {}};
+}
+
 sub authoritative_grant_subscription_id {
   my ($server) = @_;
   return 'irc.authority.grants:' . $server->{config}{network};
@@ -190,17 +273,13 @@ sub record_authoritative_discovery_event {
     event   => $event,
   );
   return 0 unless defined $channel;
-
-  my %tags = $server->_first_tag_values($event->{tags});
-  my $group_id = $tags{d} || $tags{h};
-  if (Overnet::Authority::HostedChannel::group_event_is_tombstoned(event => $event)) {
-    return forget_authoritative_discovered_channel($server, $channel);
-  }
-  return remember_authoritative_discovered_channel(
+  my $merged = _merge_authoritative_events(
     $server,
-    channel  => $channel,
-    group_id => $group_id,
+    _all_authoritative_discovery_events($server),
+    [ $event ],
   );
+  _set_authoritative_discovery_events($server, $merged);
+  return 1;
 }
 
 sub refresh_authoritative_discovery_cache {
@@ -216,12 +295,12 @@ sub refresh_authoritative_discovery_cache {
     $subscription_id,
     ($args{refresh} ? (refresh => 1) : ()),
   );
-  $events = $server->_sort_authoritative_events($events);
-  my $count = 0;
-  for my $event (@{$events || []}) {
-    $count += record_authoritative_discovery_event($server, $event) || 0;
-  }
-  return $count;
+  my $merged = _merge_authoritative_events(
+    $server,
+    _all_authoritative_discovery_events($server),
+    $events,
+  );
+  return _set_authoritative_discovery_events($server, $merged);
 }
 
 sub query_nostr_events {
@@ -342,11 +421,15 @@ sub refresh_authoritative_nip29_channel_cache {
   return [] unless defined $canonical;
 
   my $cache = ($server->{authoritative_channel_cache}{$canonical} ||= {});
+  my $old_events = ref($cache->{events}) eq 'ARRAY'
+    ? $cache->{events}
+    : [];
   my $events = load_authoritative_nip29_events(
     $server,
     $canonical,
     (defined $args{refresh} ? (refresh => $args{refresh}) : ()),
   );
+  $events = _merge_authoritative_events($server, $old_events, $events);
   my $view = $server->_derive_authoritative_channel_view_from_events($canonical, $events);
   $cache->{events} = $events;
   $cache->{view} = $view;
