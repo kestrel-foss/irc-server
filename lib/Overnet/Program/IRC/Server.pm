@@ -1112,6 +1112,64 @@ sub _send_end_of_ban_list {
   );
 }
 
+sub _send_exception_list_entry {
+  my ($self, $client_id, $channel, $exception_mask) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::exception_list_entry_line(
+      server_name    => $self->{config}{server_name},
+      nick           => $self->_client_numeric_target($client),
+      channel        => $channel,
+      exception_mask => $exception_mask,
+    ),
+  );
+}
+
+sub _send_end_of_exception_list {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::end_of_exception_list_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
+    ),
+  );
+}
+
+sub _send_invite_exception_list_entry {
+  my ($self, $client_id, $channel, $invite_exception_mask) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::invite_exception_list_entry_line(
+      server_name           => $self->{config}{server_name},
+      nick                  => $self->_client_numeric_target($client),
+      channel               => $channel,
+      invite_exception_mask => $invite_exception_mask,
+    ),
+  );
+}
+
+sub _send_end_of_invite_exception_list {
+  my ($self, $client_id, $channel) = @_;
+  my $client = $self->{clients}{$client_id}
+    or return 0;
+
+  return $self->_send_client_line($client_id,
+    Overnet::Program::IRC::Renderer::end_of_invite_exception_list_line(
+      server_name => $self->{config}{server_name},
+      nick        => $self->_client_numeric_target($client),
+      channel     => $channel,
+    ),
+  );
+}
+
 sub _send_inviting {
   my ($self, $client_id, $target_nick, $channel) = @_;
   my $client = $self->{clients}{$client_id}
@@ -1134,12 +1192,17 @@ sub _send_channel_mode_is {
   my $display_channel = $self->_canonical_channel_name($channel);
   return 0 unless defined $display_channel;
   my $channel_modes = '+n';
+  my @mode_args;
 
   if (my $authoritative = $self->_derive_authoritative_channel_state($display_channel, force => 1)) {
     $channel_modes = $authoritative->{channel_modes}
       if defined $authoritative->{channel_modes}
         && !ref($authoritative->{channel_modes})
         && length($authoritative->{channel_modes});
+    push @mode_args, $authoritative->{channel_key}
+      if defined($authoritative->{channel_key}) && !ref($authoritative->{channel_key}) && length($authoritative->{channel_key});
+    push @mode_args, $authoritative->{user_limit}
+      if defined($authoritative->{user_limit}) && !ref($authoritative->{user_limit});
   }
 
   return $self->_send_client_line($client_id,
@@ -1148,6 +1211,7 @@ sub _send_channel_mode_is {
       nick          => $self->_client_numeric_target($client),
       channel       => $display_channel,
       channel_modes => $channel_modes,
+      mode_args     => \@mode_args,
     ),
   );
 }
@@ -1712,6 +1776,7 @@ sub _derive_authoritative_join_admission_from_events {
           authoritative_events => $authoritative_events,
           (defined $args{actor_pubkey} ? (actor_pubkey => $args{actor_pubkey}) : ()),
           (defined $args{actor_mask} ? (actor_mask => $args{actor_mask}) : ()),
+          (ref($args{extra_input}) eq 'HASH' ? %{$args{extra_input}} : ()),
         },
       },
     );
@@ -1788,6 +1853,10 @@ sub _authoritative_channel_state_from_view {
     group_ref         => $view->{group_ref},
     channel_modes     => $view->{channel_modes},
     (ref($view->{ban_masks}) eq 'ARRAY' ? (ban_masks => [ @{$view->{ban_masks}} ]) : ()),
+    (ref($view->{exception_masks}) eq 'ARRAY' ? (exception_masks => [ @{$view->{exception_masks}} ]) : ()),
+    (ref($view->{invite_exception_masks}) eq 'ARRAY' ? (invite_exception_masks => [ @{$view->{invite_exception_masks}} ]) : ()),
+    (defined($view->{channel_key}) ? (channel_key => $view->{channel_key}) : ()),
+    (defined($view->{user_limit}) ? (user_limit => $view->{user_limit}) : ()),
     (exists $view->{topic} ? (topic => $view->{topic}) : ()),
     (exists $view->{topic_actor_pubkey} ? (topic_actor_pubkey => $view->{topic_actor_pubkey}) : ()),
     ($view->{tombstoned} ? (tombstoned => 1) : ()),
@@ -2238,6 +2307,10 @@ sub _authoritative_group_metadata_from_state {
     moderated        => $self->_channel_mode_enabled($state, 'm') ? 1 : 0,
     topic_restricted => $self->_channel_mode_enabled($state, 't') ? 1 : 0,
     ban_masks        => ref($state->{ban_masks}) eq 'ARRAY' ? [ @{$state->{ban_masks}} ] : [],
+    (ref($state->{exception_masks}) eq 'ARRAY' && @{$state->{exception_masks}} ? (exception_masks => [ @{$state->{exception_masks}} ]) : ()),
+    (ref($state->{invite_exception_masks}) eq 'ARRAY' && @{$state->{invite_exception_masks}} ? (invite_exception_masks => [ @{$state->{invite_exception_masks}} ]) : ()),
+    (defined($state->{channel_key}) ? (channel_key => $state->{channel_key}) : ()),
+    (defined($state->{user_limit}) ? (user_limit => $state->{user_limit}) : ()),
     tombstoned       => $state->{tombstoned} ? 1 : 0,
     (exists($state->{topic}) ? (topic => $state->{topic}) : ()),
   };
@@ -2351,9 +2424,10 @@ sub _apply_authoritative_channel_tombstone {
 }
 
 sub _authoritative_join_admission_for_client {
-  my ($self, $channel, $client) = @_;
+  my ($self, $channel, $client, %args) = @_;
   my $pubkey = $self->_client_authoritative_pubkey($client);
   my $actor_mask = $self->_authoritative_irc_mask_for_client($client);
+  my $join_key = $args{join_key};
   my $events = $self->_read_authoritative_nip29_events($channel);
   $events = $self->_read_authoritative_nip29_events($channel, force => 1)
     if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled;
@@ -2379,6 +2453,7 @@ sub _authoritative_join_admission_for_client {
         $channel,
         actor_pubkey              => $pubkey,
         actor_mask                => $actor_mask,
+        (defined($join_key) ? (extra_input => { join_key => $join_key }) : ()),
         reconcile_pending_invites => 1,
       )
     : $self->_derive_authoritative_join_admission($channel);
@@ -2389,6 +2464,7 @@ sub _authoritative_join_admission_for_client {
           force                     => 1,
           actor_pubkey              => $pubkey,
           actor_mask                => $actor_mask,
+          (defined($join_key) ? (extra_input => { join_key => $join_key }) : ()),
           reconcile_pending_invites => 1,
         )
       : $self->_derive_authoritative_join_admission($channel, force => 1);
@@ -2578,6 +2654,10 @@ sub _authoritative_mode_write_permission_for_client {
         (defined $permission->{target_pubkey} ? (target_pubkey => $permission->{target_pubkey}) : ()),
         (ref($permission->{current_roles}) eq 'ARRAY' ? (current_roles => [ @{$permission->{current_roles}} ]) : ()),
         (defined $permission->{normalized_ban_mask} ? (normalized_ban_mask => $permission->{normalized_ban_mask}) : ()),
+        (defined $permission->{normalized_exception_mask} ? (normalized_exception_mask => $permission->{normalized_exception_mask}) : ()),
+        (defined $permission->{normalized_invite_exception_mask} ? (normalized_invite_exception_mask => $permission->{normalized_invite_exception_mask}) : ()),
+        (defined $permission->{channel_key} ? (channel_key => $permission->{channel_key}) : ()),
+        (defined $permission->{user_limit} ? (user_limit => $permission->{user_limit}) : ()),
         (ref($permission->{group_metadata}) eq 'HASH' ? (group_metadata => { %{$permission->{group_metadata}} }) : ()),
       };
     }
@@ -2608,6 +2688,22 @@ sub _authoritative_mode_write_permission_for_client {
     $permission{current_roles} = [ @{$member->{roles} || []} ];
   } elsif ($mode =~ /\A[+-][b]\z/ && defined($mode_args->[0])) {
     $permission{normalized_ban_mask} = $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A[+-][e]\z/ && defined($mode_args->[0])) {
+    $permission{normalized_exception_mask} = $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A[+-][I]\z/ && defined($mode_args->[0])) {
+    $permission{normalized_invite_exception_mask} = $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A\+k\z/ && defined($mode_args->[0])) {
+    $permission{channel_key} = $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A-k\z/) {
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A\+l\z/ && defined($mode_args->[0])) {
+    $permission{user_limit} = 0 + $mode_args->[0];
+    $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
+  } elsif ($mode =~ /\A-l\z/) {
     $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
   } elsif ($mode =~ /\A[+-][imt]\z/) {
     $permission{group_metadata} = $self->_authoritative_group_metadata_from_state($state);
@@ -3000,6 +3096,28 @@ sub _handle_authoritative_mode_command {
     return 1;
   }
 
+  if ($mode eq '+e' && (!defined($params[2]) || ref($params[2]) || !length($params[2]))) {
+    my $view = $self->_derive_authoritative_channel_view($channel);
+    $view = $self->_derive_authoritative_channel_view($channel, force => 1)
+      unless ref($view) eq 'HASH';
+    for my $exception_mask (@{ref($view) eq 'HASH' && ref($view->{exception_masks}) eq 'ARRAY' ? $view->{exception_masks} : []}) {
+      $self->_send_exception_list_entry($client_id, $channel, $exception_mask);
+    }
+    $self->_send_end_of_exception_list($client_id, $channel);
+    return 1;
+  }
+
+  if ($mode eq '+I' && (!defined($params[2]) || ref($params[2]) || !length($params[2]))) {
+    my $view = $self->_derive_authoritative_channel_view($channel);
+    $view = $self->_derive_authoritative_channel_view($channel, force => 1)
+      unless ref($view) eq 'HASH';
+    for my $invite_exception_mask (@{ref($view) eq 'HASH' && ref($view->{invite_exception_masks}) eq 'ARRAY' ? $view->{invite_exception_masks} : []}) {
+      $self->_send_invite_exception_list_entry($client_id, $channel, $invite_exception_mask);
+    }
+    $self->_send_end_of_invite_exception_list($client_id, $channel);
+    return 1;
+  }
+
   my @mode_args;
   my $mode_line = sprintf(':%s MODE %s %s', $client->{nick}, $channel, $mode);
   if ($mode =~ /\A[+-][ov]\z/) {
@@ -3017,10 +3135,25 @@ sub _handle_authoritative_mode_command {
       unless defined $target_pubkey;
     @mode_args = ($target_pubkey);
     $mode_line .= ' ' . $target_nick;
-  } elsif ($mode =~ /\A[+-][bimt]\z/) {
+  } elsif ($mode =~ /\A[+-][beIklimt]\z/) {
     if ($mode =~ /\A[+-]b\z/) {
       return $self->_send_need_more_params($client_id, 'MODE')
         unless defined $params[2] && !ref($params[2]) && length($params[2]);
+      @mode_args = ($params[2]);
+      $mode_line .= ' ' . $params[2];
+    } elsif ($mode =~ /\A[+-][eI]\z/) {
+      return $self->_send_need_more_params($client_id, 'MODE')
+        unless defined $params[2] && !ref($params[2]) && length($params[2]);
+      @mode_args = ($params[2]);
+      $mode_line .= ' ' . $params[2];
+    } elsif ($mode =~ /\A\+k\z/) {
+      return $self->_send_need_more_params($client_id, 'MODE')
+        unless defined $params[2] && !ref($params[2]) && length($params[2]);
+      @mode_args = ($params[2]);
+      $mode_line .= ' ' . $params[2];
+    } elsif ($mode =~ /\A\+l\z/) {
+      return $self->_send_need_more_params($client_id, 'MODE')
+        unless defined $params[2] && !ref($params[2]) && $params[2] =~ /\A[1-9][0-9]*\z/;
       @mode_args = ($params[2]);
       $mode_line .= ' ' . $params[2];
     }
@@ -3055,6 +3188,14 @@ sub _handle_authoritative_mode_command {
     if ref($permission->{group_metadata}) eq 'HASH';
   $input{ban_mask} = $permission->{normalized_ban_mask}
     if defined $permission->{normalized_ban_mask};
+  $input{exception_mask} = $permission->{normalized_exception_mask}
+    if defined $permission->{normalized_exception_mask};
+  $input{invite_exception_mask} = $permission->{normalized_invite_exception_mask}
+    if defined $permission->{normalized_invite_exception_mask};
+  $input{channel_key} = $permission->{channel_key}
+    if defined $permission->{channel_key};
+  $input{user_limit} = $permission->{user_limit}
+    if defined $permission->{user_limit};
 
   if ($self->_authority_relay_enabled && !$self->_client_has_authoritative_delegation($client)) {
     $self->_send_server_notice($client_id, 'OVERNETAUTH DELEGATE is required for authoritative MODE');

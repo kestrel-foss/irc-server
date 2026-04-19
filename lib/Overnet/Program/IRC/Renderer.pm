@@ -162,9 +162,10 @@ sub chan_op_privs_needed_line {
 
 sub cannot_join_channel_line {
   my (%args) = @_;
-  my $numeric = defined($args{reason}) && $args{reason} eq '+b'
-    ? 474
-    : 473;
+  my $numeric = 473;
+  $numeric = 474 if defined($args{reason}) && $args{reason} eq '+b';
+  $numeric = 475 if defined($args{reason}) && $args{reason} eq '+k';
+  $numeric = 471 if defined($args{reason}) && $args{reason} eq '+l';
   my $reason = 'Cannot join channel';
   $reason .= ' (' . $args{reason} . ')'
     if defined($args{reason}) && length($args{reason});
@@ -201,6 +202,50 @@ sub end_of_ban_list_line {
   );
 }
 
+sub exception_list_entry_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 348 %s %s %s %s 0',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+    $args{exception_mask},
+    $args{server_name},
+  );
+}
+
+sub end_of_exception_list_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 349 %s %s :End of channel exception list',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+  );
+}
+
+sub invite_exception_list_entry_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 346 %s %s %s %s 0',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+    $args{invite_exception_mask},
+    $args{server_name},
+  );
+}
+
+sub end_of_invite_exception_list_line {
+  my (%args) = @_;
+  return sprintf(
+    ':%s 347 %s %s :End of channel invite exception list',
+    $args{server_name},
+    $args{nick},
+    $args{channel},
+  );
+}
+
 sub inviting_line {
   my (%args) = @_;
   return sprintf(
@@ -214,12 +259,16 @@ sub inviting_line {
 
 sub channel_mode_is_line {
   my (%args) = @_;
+  my $suffix = join ' ',
+    grep { defined($_) && !ref($_) && length($_) }
+    @{$args{mode_args} || []};
   return sprintf(
-    ':%s 324 %s %s %s',
+    ':%s 324 %s %s %s%s',
     $args{server_name},
     $args{nick},
     $args{channel},
     $args{channel_modes},
+    (length($suffix) ? ' ' . $suffix : ''),
   );
 }
 

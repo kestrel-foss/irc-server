@@ -195,7 +195,14 @@ sub handle_join {
   my $authoritative_join;
 
   if ($server->_is_authoritative_channel($channel)) {
-    $authoritative_join = $server->_authoritative_join_admission_for_client($channel, $client);
+    my $join_key = @params >= 2 && defined($params[1]) && !ref($params[1]) && length($params[1])
+      ? $params[1]
+      : undef;
+    $authoritative_join = $server->_authoritative_join_admission_for_client(
+      $channel,
+      $client,
+      (defined($join_key) ? (join_key => $join_key) : ()),
+    );
     if (defined $already_joined) {
       if ($authoritative_join->{allowed} && $authoritative_join->{present}) {
         return 1;
@@ -241,6 +248,7 @@ sub handle_join {
               target         => $channel,
               actor_pubkey   => $server->_client_authoritative_pubkey($client),
               actor_mask     => $server->_authoritative_irc_mask_for_client($client),
+              (defined $join_key ? (join_key => $join_key) : ()),
               (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
               ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
               ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
@@ -266,6 +274,7 @@ sub handle_join {
             target       => $channel,
             actor_pubkey => $server->_client_authoritative_pubkey($client),
             actor_mask   => $server->_authoritative_irc_mask_for_client($client),
+            (defined $join_key ? (join_key => $join_key) : ()),
             (defined $authoritative_join->{invite_code} ? (invite_code => $authoritative_join->{invite_code}) : ()),
             ($authoritative_join->{create_channel} ? (create_channel => 1) : ()),
             ($authoritative_join->{create_channel} ? (group_metadata => { name => $channel }) : ()),
