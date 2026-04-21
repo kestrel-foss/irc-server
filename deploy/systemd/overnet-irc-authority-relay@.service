@@ -1,0 +1,21 @@
+[Unit]
+Description=Overnet IRC Authority Relay %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/overnet/%i/overnet-irc-authority-relay.env
+ExecStart=/usr/bin/env perl /opt/overnet/overnet-program-irc/bin/overnet-irc-authority-relay-service.pl \
+  --host ${OVERNET_IRC_AUTHORITY_RELAY_HOST} \
+  --port ${OVERNET_IRC_AUTHORITY_RELAY_PORT} \
+  --relay-url ${OVERNET_IRC_AUTHORITY_RELAY_URL} \
+  --grant-kind ${OVERNET_IRC_AUTHORITY_RELAY_GRANT_KIND} \
+  --store-file ${OVERNET_IRC_AUTHORITY_RELAY_STORE_FILE} \
+  --health-file ${OVERNET_IRC_AUTHORITY_RELAY_HEALTH_FILE} \
+  --log-file ${OVERNET_IRC_AUTHORITY_RELAY_LOG_FILE}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

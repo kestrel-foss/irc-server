@@ -99,7 +99,9 @@ if ($options{tls}) {
     if defined $options{tls_ca_file} && length $options{tls_ca_file};
 }
 
-my $adapter_config = {};
+my $adapter_config = {
+  network => $options{network},
+};
 $adapter_config->{group_host} = $options{group_host}
   if defined $options{group_host} && length $options{group_host};
 if (@channel_group_args) {
@@ -117,6 +119,7 @@ if (defined $options{authority_relay_url} && length $options{authority_relay_url
   $authority_relay = {
     url => $options{authority_relay_url},
   };
+  $adapter_config->{authority_profile} ||= 'nip29';
   $authority_relay->{query_timeout_ms} = 0 + $options{authority_relay_query_timeout_ms}
     if defined $options{authority_relay_query_timeout_ms};
   $authority_relay->{poll_interval_ms} = 0 + $options{authority_relay_poll_interval_ms}
