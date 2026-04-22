@@ -32,6 +32,7 @@ WriteMakefile(
         t/00-load.t
         t/bin-syntax.t
         t/makemaker-metadata.t
+        t/manifest-skip-policy.t
       )
     ),
   },

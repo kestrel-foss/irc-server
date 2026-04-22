@@ -1,0 +1,14 @@
+^\.git/
+^\.plx/
+^local/
+^_eumm/
+^blib/
+^Makefile$
+^MYMETA\.json$
+^MYMETA\.yml$
+^pm_to_blib(?:\.ts)?$
+(?:^|/)\.DS_Store$
+(?:^|/).*\.swp$
+(?:^|/).*~$
+(?:^|/).*\.orig$
+(?:^|/).*\.rej$
