@@ -41,6 +41,7 @@ is_deeply(
 is_deeply(
   $args->{EXE_FILES},
   [
+    'bin/overnet-irc-auth.pl',
     'bin/overnet-irc-authority-relay-service.pl',
     'bin/overnet-irc-authority-relay.pl',
     'bin/overnet-irc-chat-client.pl',
@@ -70,6 +71,7 @@ is_deeply(
       qw(
         t/00-load.t
         t/bin-syntax.t
+        t/irc-auth-helper.t
         t/makemaker-metadata.t
         t/manifest-skip-policy.t
       )

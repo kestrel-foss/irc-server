@@ -6,6 +6,7 @@ use FindBin;
 use Test::More;
 
 my @scripts = (
+  'bin/overnet-irc-auth.pl',
   'bin/overnet-irc-authority-relay-service.pl',
   'bin/overnet-irc-authority-relay.pl',
   'bin/overnet-irc-chat-client.pl',
