@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/overnet/%i/overnet-irc.env
-ExecStart=/usr/bin/env perl /opt/overnet/overnet-program-irc/bin/overnet-irc-service.pl \
+ExecStart=/usr/bin/env perl /opt/overnet/irc-server/bin/overnet-irc-service.pl \
   --adapter-id ${OVERNET_IRC_ADAPTER_ID} \
   --network ${OVERNET_IRC_NETWORK} \
   --listen-host ${OVERNET_IRC_LISTEN_HOST} \

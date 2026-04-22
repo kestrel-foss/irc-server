@@ -10,8 +10,8 @@ use FindBin;
 use Getopt::Long qw(GetOptions);
 use JSON::PP ();
 use lib "$FindBin::Bin/../lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../core-perl/lib";
+use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
 use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file);
 
 use Overnet::Core::Nostr;
@@ -128,7 +128,7 @@ if (defined $options{authority_relay_url} && length $options{authority_relay_url
 
 _append_log($log_file, "starting IRC service\n");
 
-my $adapter_lib = File::Spec->catdir($FindBin::Bin, '..', '..', 'overnet-adapter-irc', 'lib');
+my $adapter_lib = File::Spec->catdir($FindBin::Bin, '..', '..', 'adapter-irc-perl', 'lib');
 my $program_path = File::Spec->catfile($FindBin::Bin, 'overnet-irc-server.pl');
 my $child_wrapper = q{$SIG{INT} = 'IGNORE'; exec $^X, @ARGV or die "exec failed: $!";};
 
@@ -405,9 +405,9 @@ sub _ensure_tls_material {
 sub _default_state_dir {
   my $xdg = $ENV{XDG_STATE_HOME};
   if (defined $xdg && !ref($xdg) && length($xdg)) {
-    return File::Spec->catdir($xdg, 'overnet-program-irc');
+    return File::Spec->catdir($xdg, 'irc-server');
   }
-  return File::Spec->catdir($ENV{HOME} || '.', '.local', 'state', 'overnet-program-irc');
+  return File::Spec->catdir($ENV{HOME} || '.', '.local', 'state', 'irc-server');
 }
 
 sub _usage {

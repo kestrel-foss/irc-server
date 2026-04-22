@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use FindBin;
-use lib "$FindBin::Bin/../../overnet-core-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
 use IO::Handle ();
 use IO::Select;
 use IO::Socket::INET;
@@ -340,7 +340,7 @@ HELP
 sub _usage {
   return <<'USAGE';
 Usage:
-  /opt/perl-5.42/bin/perl overnet-program-irc/bin/overnet-irc-chat-client.pl --nick NICK [options]
+  /opt/perl-5.42/bin/perl irc-server/bin/overnet-irc-chat-client.pl --nick NICK [options]
 
 Options:
   --host HOST        IRC server host (default: 127.0.0.1)

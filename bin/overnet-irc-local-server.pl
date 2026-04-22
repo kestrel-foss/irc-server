@@ -7,8 +7,8 @@ use File::Spec;
 use FindBin;
 use Getopt::Long qw(GetOptions);
 use lib "$FindBin::Bin/../lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../core-perl/lib";
+use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
 use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file);
 
 use Overnet::Core::Nostr;
@@ -86,7 +86,7 @@ if ($options{tls}) {
     if defined $options{tls_ca_file} && length $options{tls_ca_file};
 }
 
-my $adapter_lib = File::Spec->catdir($FindBin::Bin, '..', '..', 'overnet-adapter-irc', 'lib');
+my $adapter_lib = File::Spec->catdir($FindBin::Bin, '..', '..', 'adapter-irc-perl', 'lib');
 my $program_path = File::Spec->catfile($FindBin::Bin, 'overnet-irc-server.pl');
 my $child_wrapper = q{$SIG{INT} = 'IGNORE'; exec $^X, @ARGV or die "exec failed: $!";};
 
@@ -321,11 +321,11 @@ sub _ensure_tls_material {
 }
 
 sub _default_state_dir {
-  return File::Spec->catdir($ENV{XDG_STATE_HOME}, 'overnet-program-irc')
+  return File::Spec->catdir($ENV{XDG_STATE_HOME}, 'irc-server')
     if defined $ENV{XDG_STATE_HOME} && length $ENV{XDG_STATE_HOME};
-  return File::Spec->catdir($ENV{HOME}, '.local', 'state', 'overnet-program-irc')
+  return File::Spec->catdir($ENV{HOME}, '.local', 'state', 'irc-server')
     if defined $ENV{HOME} && length $ENV{HOME};
-  return File::Spec->catdir(File::Spec->tmpdir, 'overnet-program-irc');
+  return File::Spec->catdir(File::Spec->tmpdir, 'irc-server');
 }
 
 sub _hexchat_connect_host {
@@ -345,7 +345,7 @@ sub _shell_quote {
 sub _usage {
   return <<'USAGE';
 Usage:
-  /opt/perl-5.42/bin/perl overnet-program-irc/bin/overnet-irc-local-server.pl [options]
+  /opt/perl-5.42/bin/perl irc-server/bin/overnet-irc-local-server.pl [options]
 
 Options:
   --adapter-id ID         Adapter id to register and use (default: irc.local)

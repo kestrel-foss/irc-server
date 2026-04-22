@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/overnet/%i/overnet-irc-authority-relay.env
-ExecStart=/usr/bin/env perl /opt/overnet/overnet-program-irc/bin/overnet-irc-authority-relay-service.pl \
+ExecStart=/usr/bin/env perl /opt/overnet/irc-server/bin/overnet-irc-authority-relay-service.pl \
   --host ${OVERNET_IRC_AUTHORITY_RELAY_HOST} \
   --port ${OVERNET_IRC_AUTHORITY_RELAY_PORT} \
   --relay-url ${OVERNET_IRC_AUTHORITY_RELAY_URL} \

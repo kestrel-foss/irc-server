@@ -5,10 +5,10 @@ use warnings;
 use FindBin;
 use Getopt::Long qw(GetOptions);
 use lib "$FindBin::Bin/../lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/local/lib/perl5";
-use lib "$FindBin::Bin/../../overnet-relay-perl/lib";
-use lib "$FindBin::Bin/../../overnet-relay-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../core-perl/lib";
+use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../relay-perl/lib";
+use lib "$FindBin::Bin/../../relay-perl/local/lib/perl5";
 
 use Overnet::Authority::HostedChannel::Relay qw(build_authoritative_relay);
 

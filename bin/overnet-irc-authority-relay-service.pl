@@ -229,9 +229,9 @@ sub _write_health_file {
 sub _default_state_dir {
   my $xdg = $ENV{XDG_STATE_HOME};
   if (defined $xdg && !ref($xdg) && length($xdg)) {
-    return File::Spec->catdir($xdg, 'overnet-program-irc');
+    return File::Spec->catdir($xdg, 'irc-server');
   }
-  return File::Spec->catdir($ENV{HOME} || '.', '.local', 'state', 'overnet-program-irc');
+  return File::Spec->catdir($ENV{HOME} || '.', '.local', 'state', 'irc-server');
 }
 
 sub _usage {

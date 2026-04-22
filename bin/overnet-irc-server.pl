@@ -2,8 +2,8 @@ use strict;
 use warnings;
 use FindBin;
 use lib "$FindBin::Bin/../lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/lib";
-use lib "$FindBin::Bin/../../overnet-core-perl/local/lib/perl5";
+use lib "$FindBin::Bin/../../core-perl/lib";
+use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
 
 use Overnet::Program::IRC::Server;
 
