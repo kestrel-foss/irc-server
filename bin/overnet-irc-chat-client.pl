@@ -1,7 +1,6 @@
+#!/usr/bin/env perl
 use strict;
 use warnings;
-use FindBin;
-use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
 use IO::Handle ();
 use IO::Select;
 use IO::Socket::INET;

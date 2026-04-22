@@ -9,9 +9,10 @@ use File::Spec;
 use FindBin;
 use Getopt::Long qw(GetOptions);
 use JSON::PP ();
-use lib "$FindBin::Bin/../lib";
-use lib "$FindBin::Bin/../../core-perl/lib";
-use lib "$FindBin::Bin/../../core-perl/local/lib/perl5";
+use lib grep { -d $_ } (
+  "$FindBin::Bin/../lib",
+  "$FindBin::Bin/../../core-perl/lib",
+);
 use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file);
 
 use Overnet::Core::Nostr;
