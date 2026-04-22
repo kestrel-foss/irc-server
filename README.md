@@ -9,7 +9,7 @@ GitHub: <https://github.com/overnet-project/irc-server>
 Start the local demo server:
 
 ```bash
-/home/_73/.local/bin/plx perl -Ilib -I../core-perl/lib -I../core-perl/local/lib/perl5 bin/overnet-irc-local-server.pl
+perl bin/overnet-irc-local-server.pl
 ```
 
 That starts the real IRC server program under the Overnet runtime host and prints the port it bound to.
@@ -17,8 +17,8 @@ That starts the real IRC server program under the Overnet runtime host and print
 Then open two more terminals and connect two local accounts:
 
 ```bash
-/home/_73/.local/bin/plx perl -Ilib -I../core-perl/local/lib/perl5 bin/overnet-irc-chat-client.pl --nick alice
-/home/_73/.local/bin/plx perl -Ilib -I../core-perl/local/lib/perl5 bin/overnet-irc-chat-client.pl --nick bob
+perl bin/overnet-irc-chat-client.pl --nick alice
+perl bin/overnet-irc-chat-client.pl --nick bob
 ```
 
 By default the client auto-joins `#overnet`. Plain text sends to the current target.
