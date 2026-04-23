@@ -35,6 +35,7 @@ WriteMakefile(
         t/irc-auth-helper.t
         t/makemaker-metadata.t
         t/manifest-skip-policy.t
+        t/readme-auth.t
       )
     ),
   },

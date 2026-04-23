@@ -23,6 +23,39 @@ perl bin/overnet-irc-chat-client.pl --nick bob
 
 By default the client auto-joins `#overnet`. Plain text sends to the current target.
 
+## Authenticated IRC
+
+For authoritative IRC networks, start the local auth-agent daemon first:
+
+```bash
+overnet-auth-agent.pl --config-file ~/.config/overnet/auth-agent.json
+```
+
+Then point the helper at the auth socket either with `OVERNET_AUTH_SOCK`:
+
+```bash
+export OVERNET_AUTH_SOCK=/tmp/overnet-auth.sock
+```
+
+or explicitly with `--auth-sock`:
+
+```bash
+overnet-irc-auth.pl auth --auth-sock /tmp/overnet-auth.sock --scope irc://irc.example.test/overnet --challenge <challenge>
+```
+
+The normal manual flow is:
+
+```bash
+overnet-irc-auth.pl auth --scope irc://irc.example.test/overnet --challenge <challenge>
+overnet-irc-auth.pl delegate --scope irc://irc.example.test/overnet --relay-url ws://127.0.0.1:7448 --delegate-pubkey <delegate_pubkey> --session-id <session_id> --expires-at <expires_at>
+```
+
+If you already have the full IRC notice line, bridge mode can translate it directly:
+
+```bash
+overnet-irc-auth.pl bridge --scope irc://irc.example.test/overnet --line '-server- OVERNETAUTH CHALLENGE <challenge>'
+```
+
 ## Client Commands
 
 ```text
@@ -44,6 +77,7 @@ By default the client auto-joins `#overnet`. Plain text sends to the current tar
 - The demo server defaults to `127.0.0.1:16667`.
 - It auto-creates a Nostr signing key under the local state directory unless you pass `--signing-key-file`.
 - The local demo client is intentionally small. It is a convenience terminal client for exercising the Overnet IRC server, not a full IRC client.
+- `overnet-irc-auth.pl` uses the local auth agent. It does not read raw private keys directly.
 
 ## Related Repositories
 
