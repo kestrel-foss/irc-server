@@ -118,6 +118,48 @@ subtest 'helper consumes artifacts from a daemon started from config' => sub {
   _wait_for_child($pid, 'daemon exits cleanly after the end-to-end flow');
 };
 
+subtest 'helper bridge mode consumes a continuous stream against the daemon' => sub {
+  my $dir = tempdir(CLEANUP => 1, DIR => File::Spec->catdir($FindBin::Bin, '..'));
+  my $config_file = File::Spec->catfile($dir, 'auth-agent.json');
+  my $socket_path = File::Spec->catfile($dir, 'auth.sock');
+
+  _write_config($config_file, $socket_path);
+  my ($pid, $next_socket) = _start_daemon_from_config(
+    config_file     => $config_file,
+    endpoint        => $socket_path,
+    max_connections => 2,
+  );
+
+  my $bridge_client = Overnet::Auth::Client->new(
+    endpoint       => $socket_path,
+    socket_factory => $next_socket,
+  );
+  my $input = join '',
+    ":server 001 alice :welcome\r\n",
+    "-server- OVERNETAUTH CHALLENGE $challenge\r\n",
+    "-server- OVERNETAUTH DELEGATE ", ('f' x 64), " session-123 ws://127.0.0.1:7448 1744304600\r\n";
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $bridge_client,
+    command     => 'bridge',
+    scope       => $scope,
+    input       => $in,
+    output      => $out,
+    interactive => 1,
+    quote       => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  is $count, 2, 'bridge stream emitted two auth commands';
+  like $output, qr{\A/quote OVERNETAUTH AUTH \S+\n/quote OVERNETAUTH DELEGATE \S+\n\z},
+    'bridge stream produced both auth commands from the daemon-backed flow';
+
+  _wait_for_child($pid, 'daemon exits cleanly after the bridge stream flow');
+};
+
 done_testing;
 
 sub _start_daemon_from_config {

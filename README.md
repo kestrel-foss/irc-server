@@ -56,6 +56,12 @@ If you already have the full IRC notice line, bridge mode can translate it direc
 overnet-irc-auth.pl bridge --scope irc://irc.example.test/overnet --line '-server- OVERNETAUTH CHALLENGE <challenge>'
 ```
 
+For client or ZNC scripting, bridge mode also works as a continuous stdin/stdout filter. It reads IRC lines from stdin, ignores non-`OVERNETAUTH` lines, and emits one `/quote OVERNETAUTH ...` command on stdout for each matching auth line:
+
+```bash
+some-irc-line-source | overnet-irc-auth.pl bridge --scope irc://irc.example.test/overnet
+```
+
 ## Client Commands
 
 ```text

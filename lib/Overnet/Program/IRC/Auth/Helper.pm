@@ -17,6 +17,8 @@ sub run {
     return $class->_authorize_delegate(%args);
   }
   if ($command eq 'bridge') {
+    return $class->_bridge_stream(%args)
+      unless defined($args{line}) && !ref($args{line}) && length($args{line});
     return $class->_bridge_line(%args);
   }
 
@@ -108,7 +110,8 @@ sub _bridge_line {
   die "--line is required\n"
     unless defined $line && !ref($line) && length($line);
 
-  my $parsed = $class->_parse_bridge_line($line);
+  my $parsed = $class->_maybe_parse_bridge_line($line)
+    or die "unsupported OVERNETAUTH bridge line\n";
   if ($parsed->{type} eq 'auth') {
     return $class->_authorize_auth(
       %args,
@@ -123,6 +126,39 @@ sub _bridge_line {
     session_id      => $parsed->{session_id},
     expires_at      => $parsed->{expires_at},
   );
+}
+
+sub _bridge_stream {
+  my ($class, %args) = @_;
+  my $input = $args{input} || \*STDIN;
+  my $output = $args{output} || \*STDOUT;
+  my $count = 0;
+
+  while (my $line = <$input>) {
+    my $parsed = $class->_maybe_parse_bridge_line($line);
+    next unless $parsed;
+
+    my $wire = $parsed->{type} eq 'auth'
+      ? $class->_authorize_auth(
+          %args,
+          line => undef,
+          challenge => $parsed->{challenge},
+        )
+      : $class->_authorize_delegate(
+          %args,
+          line => undef,
+          relay_url       => $parsed->{relay_url},
+          delegate_pubkey => $parsed->{delegate_pubkey},
+          session_id      => $parsed->{session_id},
+          expires_at      => $parsed->{expires_at},
+        );
+
+    print {$output} $wire
+      or die "write bridge output failed: $!";
+    $count++;
+  }
+
+  return $count;
 }
 
 sub _authorize {
@@ -180,7 +216,7 @@ sub _authorize {
     : "$wire->{payload}\n";
 }
 
-sub _parse_bridge_line {
+sub _maybe_parse_bridge_line {
   my ($class, $line) = @_;
   $line =~ s/\r?\n\z//;
 
@@ -201,7 +237,7 @@ sub _parse_bridge_line {
     };
   }
 
-  die "unsupported OVERNETAUTH bridge line\n";
+  return undef;
 }
 
 sub _service_identity_descriptor {

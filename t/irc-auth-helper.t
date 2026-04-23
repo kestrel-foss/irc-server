@@ -20,8 +20,9 @@ use Overnet::Program::IRC::Auth::Helper;
   sub new {
     my ($class, %args) = @_;
     return bless {
-      response => $args{response},
-      calls    => [],
+      response  => $args{response},
+      responses => $args{responses},
+      calls     => [],
     }, $class;
   }
 
@@ -31,6 +32,9 @@ use Overnet::Program::IRC::Auth::Helper;
       method => 'sessions.authorize',
       params => \%params,
     };
+    if (ref($self->{responses}) eq 'ARRAY' && @{$self->{responses}}) {
+      return shift @{$self->{responses}};
+    }
     return $self->{response};
   }
 
@@ -307,6 +311,181 @@ subtest 'bridge mode parses OVERNETAUTH DELEGATE lines and requests delegate art
     [ session => 'session-123' ],
     [ expires_at => '1744304600' ],
   ], 'bridge mode extracts the delegate parameters from the IRC line';
+};
+
+subtest 'bridge mode processes a continuous stdin stream and emits quote commands for matching lines only' => sub {
+  my $challenge = '6cf8a952df516a8e691c6138496516abe84ccfefa9678f518bb52f70b1ca966f';
+  my $scope = 'irc://irc.example.test/overnet';
+  my $delegate_pubkey = ('f' x 64);
+  my $client = t::irc_auth_helper::FakeClient->new(
+    responses => [
+      {
+        type   => 'response',
+        id     => 'auth-1',
+        ok     => JSON::PP::true,
+        result => {
+          artifacts => [
+            {
+              type   => 'nostr.event',
+              format => 'nostr.event',
+              value  => {
+                id         => ('2' x 64),
+                pubkey     => ('3' x 64),
+                created_at => 1744301200,
+                kind       => 22242,
+                tags       => [
+                  [ relay => $scope ],
+                  [ challenge => $challenge ],
+                ],
+                content => '',
+                sig     => ('4' x 128),
+              },
+            },
+          ],
+        },
+      },
+      {
+        type   => 'response',
+        id     => 'auth-2',
+        ok     => JSON::PP::true,
+        result => {
+          artifacts => [
+            {
+              type   => 'nostr.event',
+              format => 'nostr.event',
+              value  => {
+                id         => ('5' x 64),
+                pubkey     => ('6' x 64),
+                created_at => 1744301300,
+                kind       => 14142,
+                tags       => [
+                  [ relay => 'ws://127.0.0.1:7448' ],
+                  [ server => $scope ],
+                  [ delegate => $delegate_pubkey ],
+                  [ session => 'session-123' ],
+                  [ expires_at => '1744304600' ],
+                ],
+                content => '',
+                sig     => ('7' x 128),
+              },
+            },
+          ],
+        },
+      },
+    ],
+  );
+
+  my $input = join '',
+    ":server 001 alice :welcome\r\n",
+    "-server- OVERNETAUTH CHALLENGE $challenge\r\n",
+    ":server NOTICE alice :ignored\r\n",
+    "-server- OVERNETAUTH DELEGATE $delegate_pubkey session-123 ws://127.0.0.1:7448 1744304600\r\n";
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $client,
+    command     => 'bridge',
+    scope       => $scope,
+    input       => $in,
+    output      => $out,
+    quote       => 1,
+    interactive => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  is $count, 2, 'bridge mode reports the number of emitted auth commands';
+  like $output, qr{\A/quote OVERNETAUTH AUTH \S+\n/quote OVERNETAUTH DELEGATE \S+\n\z},
+    'bridge mode emits one quote command per matching auth line';
+  is scalar(@{$client->calls}), 2, 'only matching OVERNETAUTH lines reach the auth agent';
+  is $client->calls->[0]{params}{challenge}{value}, $challenge, 'stream mode extracted the challenge';
+  is $client->calls->[1]{params}{action}, 'session.delegate', 'stream mode extracted the delegate request';
+};
+
+subtest 'bridge mode returns zero for streams with no matching auth lines' => sub {
+  my $client = t::irc_auth_helper::FakeClient->new(
+    response => {
+      type   => 'response',
+      id     => 'auth-1',
+      ok     => JSON::PP::true,
+      result => { artifacts => [] },
+    },
+  );
+
+  my $input = ":server 001 alice :welcome\r\n:server NOTICE alice :ignored\r\n";
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $client,
+    command     => 'bridge',
+    scope       => 'irc://irc.example.test/overnet',
+    input       => $in,
+    output      => $out,
+    quote       => 1,
+    interactive => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  is $count, 0, 'bridge mode reports no generated commands';
+  is $output, '', 'bridge mode stays silent for non-auth lines';
+  is scalar(@{$client->calls}), 0, 'non-auth lines do not call the auth agent';
+};
+
+subtest 'bridge mode stream can emit payloads without /quote prefixes' => sub {
+  my $challenge = '6cf8a952df516a8e691c6138496516abe84ccfefa9678f518bb52f70b1ca966f';
+  my $scope = 'irc://irc.example.test/overnet';
+  my $client = t::irc_auth_helper::FakeClient->new(
+    response => {
+      type   => 'response',
+      id     => 'auth-1',
+      ok     => JSON::PP::true,
+      result => {
+        artifacts => [
+          {
+            type   => 'nostr.event',
+            format => 'nostr.event',
+            value  => {
+              id         => ('2' x 64),
+              pubkey     => ('3' x 64),
+              created_at => 1744301200,
+              kind       => 22242,
+              tags       => [
+                [ relay => $scope ],
+                [ challenge => $challenge ],
+              ],
+              content => '',
+              sig     => ('4' x 128),
+            },
+          },
+        ],
+      },
+    },
+  );
+
+  my $input = "-server- OVERNETAUTH CHALLENGE $challenge\r\n";
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $client,
+    command     => 'bridge',
+    scope       => $scope,
+    input       => $in,
+    output      => $out,
+    quote       => 0,
+    interactive => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  is $count, 1, 'bridge mode reports one generated payload';
+  unlike $output, qr{\A/quote },
+    'bridge mode omits /quote when quote output is disabled';
+  like $output, qr{\A\S+\n\z},
+    'bridge mode still emits the auth payload on its own line';
 };
 
 subtest 'auth mode forwards locator and service identity descriptors to the auth agent' => sub {

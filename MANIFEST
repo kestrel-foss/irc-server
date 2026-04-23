@@ -28,6 +28,7 @@ MANIFEST.SKIP
 README.md
 t/00-load.t
 t/bin-syntax.t
+t/irc-auth-cli.t
 t/irc-auth-daemon-e2e.t
 t/irc-auth-helper.t
 t/makemaker-metadata.t

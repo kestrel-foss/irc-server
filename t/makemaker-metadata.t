@@ -71,6 +71,7 @@ is_deeply(
       qw(
         t/00-load.t
         t/bin-syntax.t
+        t/irc-auth-cli.t
         t/irc-auth-helper.t
         t/makemaker-metadata.t
         t/manifest-skip-policy.t

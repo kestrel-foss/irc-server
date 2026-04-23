@@ -12,6 +12,11 @@ use lib grep { -d $_ } (
 use Overnet::Auth::Client;
 use Overnet::Program::IRC::Auth::Helper;
 
+if (@ARGV && $ARGV[0] eq '--help') {
+  print _usage();
+  exit 0;
+}
+
 my $command = shift @ARGV || '';
 my %options = (
   interactive => 1,
@@ -50,21 +55,25 @@ if ($help || !$command) {
 die _usage()
   unless $command eq 'auth' || $command eq 'delegate' || $command eq 'bridge';
 
-if ($command eq 'bridge' && !defined($options{line})) {
-  local $/;
-  $options{line} = <STDIN>;
-  die "no bridge line was provided on stdin\n"
-    unless defined $options{line} && length $options{line};
-}
-
 my $client = Overnet::Auth::Client->new(
   (defined($options{auth_sock}) ? (endpoint => $options{auth_sock}) : ()),
 );
-print Overnet::Program::IRC::Auth::Helper->run(
-  client  => $client,
-  command => $command,
-  %options,
-);
+if ($command eq 'bridge' && !defined($options{line})) {
+  Overnet::Program::IRC::Auth::Helper->run(
+    client  => $client,
+    command => $command,
+    input   => \*STDIN,
+    output  => \*STDOUT,
+    %options,
+  );
+}
+else {
+  print Overnet::Program::IRC::Auth::Helper->run(
+    client  => $client,
+    command => $command,
+    %options,
+  );
+}
 
 exit 0;
 
@@ -100,6 +109,7 @@ Delegate options:
 Bridge options:
   --line IRC_NOTICE_LINE
   --scope IRC_SCOPE
+  If --line is omitted, read IRC lines continuously from stdin.
 
 Shared output options:
   --quote

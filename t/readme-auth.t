@@ -22,6 +22,10 @@ like $content, qr/--auth-sock/,
   'README documents the explicit auth socket override';
 like $content, qr/overnet-irc-auth\.pl auth/,
   'README documents the IRC auth helper';
+like $content, qr/overnet-irc-auth\.pl bridge/,
+  'README documents bridge mode';
+like $content, qr/stdin/i,
+  'README documents stdin usage for bridge mode';
 like $content, qr/overnet-auth-agent\.pl --config-file/,
   'README documents starting the auth-agent daemon before IRC auth';
 
