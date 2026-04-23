@@ -109,7 +109,9 @@ Delegate options:
 Bridge options:
   --line IRC_NOTICE_LINE
   --scope IRC_SCOPE
+  Scope is required for OVERNETAUTH bridge input and optional for SASL NOSTR AUTHENTICATE streams.
   If --line is omitted, read IRC lines continuously from stdin.
+  Continuous bridge mode handles OVERNETAUTH notices and SASL NOSTR AUTHENTICATE challenges.
 
 Shared output options:
   --quote

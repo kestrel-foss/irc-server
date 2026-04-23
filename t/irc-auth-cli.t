@@ -20,5 +20,9 @@ like $output, qr/--line IRC_NOTICE_LINE/,
   'usage documents explicit single-line bridge mode';
 like $output, qr/stdin/i,
   'usage documents continuous stdin bridge mode';
+like $output, qr/SASL/i,
+  'usage documents SASL bridge support';
+like $output, qr/AUTHENTICATE/,
+  'usage documents AUTHENTICATE challenge handling';
 
 done_testing;

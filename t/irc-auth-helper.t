@@ -3,8 +3,8 @@ use warnings;
 
 use File::Spec;
 use FindBin;
-use JSON::PP qw(decode_json);
-use MIME::Base64 qw(decode_base64);
+use JSON::PP qw(decode_json encode_json);
+use MIME::Base64 qw(decode_base64 encode_base64);
 use Test::More;
 
 use lib grep { -d $_ } (
@@ -488,6 +488,216 @@ subtest 'bridge mode stream can emit payloads without /quote prefixes' => sub {
     'bridge mode still emits the auth payload on its own line';
 };
 
+subtest 'bridge mode processes SASL NOSTR AUTHENTICATE streams without relay delegation' => sub {
+  my $challenge = '6cf8a952df516a8e691c6138496516abe84ccfefa9678f518bb52f70b1ca966f';
+  my $scope = 'irc://irc.example.test/overnet';
+  my $auth_event = {
+    id         => ('1' x 64),
+    pubkey     => ('2' x 64),
+    created_at => 1744301600,
+    kind       => 22242,
+    tags       => [
+      [ relay => $scope ],
+      [ challenge => $challenge ],
+    ],
+    content => '',
+    sig     => ('3' x 128),
+  };
+  my $client = t::irc_auth_helper::FakeClient->new(
+    response => {
+      type   => 'response',
+      id     => 'auth-1',
+      ok     => JSON::PP::true,
+      result => {
+        artifacts => [
+          {
+            type   => 'nostr.event',
+            format => 'nostr.event',
+            value  => $auth_event,
+          },
+        ],
+      },
+    },
+  );
+
+  my $input = _authenticate_input_lines({
+    challenge => $challenge,
+    scope     => $scope,
+  });
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $client,
+    command     => 'bridge',
+    input       => $in,
+    output      => $out,
+    quote       => 1,
+    interactive => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  my @lines = grep { length } split /\n/, $output;
+  ok @lines >= 1, 'sasl bridge emitted AUTHENTICATE lines';
+  is $count, scalar(@lines), 'sasl bridge count matches emitted AUTHENTICATE lines';
+  like $lines[0], qr{\A/quote AUTHENTICATE \S+\z}, 'sasl bridge emits AUTHENTICATE commands';
+
+  my $response = _decode_authenticate_output($output);
+  is_deeply $response, {
+    auth_event => $auth_event,
+  }, 'sasl bridge preserves the auth event in the response payload';
+
+  is_deeply $client->calls, [
+    {
+      method => 'sessions.authorize',
+      params => {
+        program_id  => 'irc.bridge',
+        service     => {
+          locators => [ $scope ],
+        },
+        scope       => $scope,
+        action      => 'session.authenticate',
+        interactive => JSON::PP::true,
+        challenge   => {
+          type  => 'opaque',
+          value => $challenge,
+        },
+        artifacts => [
+          {
+            type => 'nostr.event',
+            params => {
+              kind => 22242,
+              tags => [
+                [ relay => $scope ],
+                [ challenge => $challenge ],
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ], 'sasl bridge requests only the auth artifact when delegation is absent';
+};
+
+subtest 'bridge mode processes relay-backed SASL NOSTR AUTHENTICATE streams' => sub {
+  my $challenge = '7cf8a952df516a8e691c6138496516abe84ccfefa9678f518bb52f70b1ca966f';
+  my $scope = 'irc://irc.example.test/overnet';
+  my $delegate_pubkey = ('f' x 64);
+  my $auth_event = {
+    id         => ('4' x 64),
+    pubkey     => ('5' x 64),
+    created_at => 1744301700,
+    kind       => 22242,
+    tags       => [
+      [ relay => $scope ],
+      [ challenge => $challenge ],
+    ],
+    content => '',
+    sig     => ('6' x 128),
+  };
+  my $delegate_event = {
+    id         => ('7' x 64),
+    pubkey     => ('8' x 64),
+    created_at => 1744301800,
+    kind       => 24142,
+    tags       => [
+      [ relay => 'ws://127.0.0.1:7448' ],
+      [ server => $scope ],
+      [ delegate => $delegate_pubkey ],
+      [ session => 'session-123' ],
+      [ expires_at => '1744304600' ],
+    ],
+    content => '',
+    sig     => ('9' x 128),
+  };
+  my $client = t::irc_auth_helper::FakeClient->new(
+    responses => [
+      {
+        type   => 'response',
+        id     => 'auth-1',
+        ok     => JSON::PP::true,
+        result => {
+          artifacts => [
+            {
+              type   => 'nostr.event',
+              format => 'nostr.event',
+              value  => $auth_event,
+            },
+          ],
+        },
+      },
+      {
+        type   => 'response',
+        id     => 'auth-2',
+        ok     => JSON::PP::true,
+        result => {
+          artifacts => [
+            {
+              type   => 'nostr.event',
+              format => 'nostr.event',
+              value  => $delegate_event,
+            },
+          ],
+        },
+      },
+    ],
+  );
+
+  my $input = _authenticate_input_lines({
+    challenge        => $challenge,
+    scope            => $scope,
+    relay_url        => 'ws://127.0.0.1:7448',
+    grant_kind       => 24142,
+    delegate_pubkey  => $delegate_pubkey,
+    session_id       => 'session-123',
+    expires_at       => '1744304600',
+    padding          => ('x' x 700),
+  });
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $client,
+    command     => 'bridge',
+    input       => $in,
+    output      => $out,
+    quote       => 0,
+    interactive => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  my @lines = grep { length } split /\n/, $output;
+  ok @lines >= 1, 'relay-backed sasl bridge emitted AUTHENTICATE lines';
+  is $count, scalar(@lines), 'relay-backed sasl bridge count matches emitted AUTHENTICATE lines';
+  like $lines[0], qr{\AAUTHENTICATE \S+\z}, 'relay-backed sasl bridge can emit raw AUTHENTICATE lines';
+  unlike $lines[0], qr{\A/quote }, 'relay-backed sasl bridge omits /quote when disabled';
+
+  my $response = _decode_authenticate_output($output);
+  is_deeply $response, {
+    auth_event     => $auth_event,
+    delegate_event => $delegate_event,
+  }, 'relay-backed sasl bridge preserves both returned events in the response payload';
+
+  is scalar(@{$client->calls}), 2, 'relay-backed sasl bridge makes two auth-agent requests';
+  is $client->calls->[0]{params}{action}, 'session.authenticate',
+    'relay-backed sasl bridge requests auth first';
+  is $client->calls->[0]{params}{challenge}{value}, $challenge,
+    'relay-backed sasl bridge forwards the server challenge';
+  is $client->calls->[1]{params}{action}, 'session.delegate',
+    'relay-backed sasl bridge requests delegation second';
+  is_deeply $client->calls->[1]{params}{artifacts}[0]{params}{tags}, [
+    [ relay => 'ws://127.0.0.1:7448' ],
+    [ server => $scope ],
+    [ delegate => $delegate_pubkey ],
+    [ session => 'session-123' ],
+    [ expires_at => '1744304600' ],
+  ], 'relay-backed sasl bridge forwards the delegate challenge parameters';
+  is $client->calls->[1]{params}{artifacts}[0]{params}{kind}, 24142,
+    'relay-backed sasl bridge honors grant_kind from the server challenge';
+};
+
 subtest 'auth mode forwards locator and service identity descriptors to the auth agent' => sub {
   my $challenge = '6cf8a952df516a8e691c6138496516abe84ccfefa9678f518bb52f70b1ca966f';
   my $scope = 'irc://irc.example.test/overnet';
@@ -586,5 +796,32 @@ subtest 'service identity flags require both scheme and value' => sub {
     'partial service identity descriptors are rejected';
   is scalar @{$client->calls}, 0, 'the auth agent is not called on invalid service identity input';
 };
+
+sub _authenticate_input_lines {
+  my ($payload) = @_;
+  my $encoded = encode_base64(encode_json($payload), '');
+  my @chunks;
+  while (length($encoded) > 400) {
+    push @chunks, substr($encoded, 0, 400, '');
+  }
+  push @chunks, $encoded if length $encoded;
+
+  return join '', map { ":server AUTHENTICATE $_\r\n" } @chunks;
+}
+
+sub _decode_authenticate_output {
+  my ($output) = @_;
+  my $payload = join '',
+    map {
+      my $line = $_;
+      $line =~ s/\A\/quote\s+//;
+      $line =~ s/\AAUTHENTICATE\s+//;
+      $line eq '+' ? () : $line;
+    }
+    grep { length }
+    split /\n/, $output;
+
+  return decode_json(decode_base64($payload));
+}
 
 done_testing;

@@ -4,7 +4,9 @@ use strict;
 use warnings;
 
 use JSON::PP ();
+use MIME::Base64 qw(decode_base64 encode_base64);
 use Overnet::Auth::Bridge::IRC;
+use Overnet::Program::IRC::Renderer ();
 
 sub run {
   my ($class, %args) = @_;
@@ -27,6 +29,16 @@ sub run {
 
 sub _authorize_auth {
   my ($class, %args) = @_;
+  my $artifact = $class->_authorize_auth_artifact(%args);
+  return $class->_render_irc_artifact(
+    artifact    => $artifact,
+    irc_command => 'OVERNETAUTH AUTH',
+    quote       => $args{quote},
+  );
+}
+
+sub _authorize_auth_artifact {
+  my ($class, %args) = @_;
   my $challenge = $args{challenge};
   my $scope = $args{scope};
 
@@ -35,10 +47,9 @@ sub _authorize_auth {
   die "--scope is required\n"
     unless defined $scope && !ref($scope) && length($scope);
 
-  return $class->_authorize(
+  return $class->_authorize_artifact(
     %args,
     action      => 'session.authenticate',
-    irc_command => 'OVERNETAUTH AUTH',
     challenge   => {
       type  => 'opaque',
       value => $challenge,
@@ -59,6 +70,16 @@ sub _authorize_auth {
 }
 
 sub _authorize_delegate {
+  my ($class, %args) = @_;
+  my $artifact = $class->_authorize_delegate_artifact(%args);
+  return $class->_render_irc_artifact(
+    artifact    => $artifact,
+    irc_command => 'OVERNETAUTH DELEGATE',
+    quote       => $args{quote},
+  );
+}
+
+sub _authorize_delegate_artifact {
   my ($class, %args) = @_;
   my $relay_url = $args{relay_url};
   my $scope = $args{scope};
@@ -87,15 +108,14 @@ sub _authorize_delegate {
   push @tags, [ nick => $args{nick} ]
     if defined($args{nick}) && !ref($args{nick}) && length($args{nick});
 
-  return $class->_authorize(
+  return $class->_authorize_artifact(
     %args,
     action      => 'session.delegate',
-    irc_command => 'OVERNETAUTH DELEGATE',
     artifacts   => [
       {
         type => 'nostr.event',
         params => {
-          kind => 14142,
+          kind => defined($args{grant_kind}) ? $args{grant_kind} : 14142,
           tags => \@tags,
         },
       },
@@ -133,26 +153,62 @@ sub _bridge_stream {
   my $input = $args{input} || \*STDIN;
   my $output = $args{output} || \*STDOUT;
   my $count = 0;
+  my %sasl_state;
 
   while (my $line = <$input>) {
     my $parsed = $class->_maybe_parse_bridge_line($line);
-    next unless $parsed;
+    if ($parsed) {
+      my $wire = $parsed->{type} eq 'auth'
+        ? $class->_authorize_auth(
+            %args,
+            line => undef,
+            challenge => $parsed->{challenge},
+          )
+        : $class->_authorize_delegate(
+            %args,
+            line => undef,
+            relay_url       => $parsed->{relay_url},
+            delegate_pubkey => $parsed->{delegate_pubkey},
+            session_id      => $parsed->{session_id},
+            expires_at      => $parsed->{expires_at},
+          );
 
-    my $wire = $parsed->{type} eq 'auth'
-      ? $class->_authorize_auth(
-          %args,
-          line => undef,
-          challenge => $parsed->{challenge},
-        )
-      : $class->_authorize_delegate(
-          %args,
-          line => undef,
-          relay_url       => $parsed->{relay_url},
-          delegate_pubkey => $parsed->{delegate_pubkey},
-          session_id      => $parsed->{session_id},
-          expires_at      => $parsed->{expires_at},
-        );
+      print {$output} $wire
+        or die "write bridge output failed: $!";
+      $count++;
+      next;
+    }
 
+    if (my $chunk = $class->_maybe_parse_sasl_chunk($line)) {
+      my @lines = $class->_consume_sasl_chunk(
+        %args,
+        state => \%sasl_state,
+        chunk => $chunk->{chunk},
+      );
+      for my $wire (@lines) {
+        print {$output} $wire
+          or die "write bridge output failed: $!";
+        $count++;
+      }
+      next;
+    }
+
+    my @flush = $class->_flush_sasl_chunk_state(
+      %args,
+      state => \%sasl_state,
+    );
+    for my $wire (@flush) {
+      print {$output} $wire
+        or die "write bridge output failed: $!";
+      $count++;
+    }
+  }
+
+  my @flush = $class->_flush_sasl_chunk_state(
+    %args,
+    state => \%sasl_state,
+  );
+  for my $wire (@flush) {
     print {$output} $wire
       or die "write bridge output failed: $!";
     $count++;
@@ -161,7 +217,7 @@ sub _bridge_stream {
   return $count;
 }
 
-sub _authorize {
+sub _authorize_artifact {
   my ($class, %args) = @_;
   my $client = $args{client};
   die "client is required\n"
@@ -204,16 +260,7 @@ sub _authorize {
         && ref($response->{result}{artifacts}) eq 'ARRAY'
         && @{$response->{result}{artifacts}};
 
-  my $wire = Overnet::Auth::Bridge::IRC->encode_artifact(
-    artifact => $response->{result}{artifacts}[0],
-    protocol => 'irc',
-    command  => $args{irc_command},
-    encoding => 'base64-json',
-  );
-
-  return $args{quote}
-    ? "/quote $wire->{command} $wire->{payload}\n"
-    : "$wire->{payload}\n";
+  return $response->{result}{artifacts}[0];
 }
 
 sub _maybe_parse_bridge_line {
@@ -238,6 +285,123 @@ sub _maybe_parse_bridge_line {
   }
 
   return undef;
+}
+
+sub _maybe_parse_sasl_chunk {
+  my ($class, $line) = @_;
+  $line =~ s/\r?\n\z//;
+
+  return undef
+    unless $line =~ /\A(?::\S+\s+)?AUTHENTICATE\s+(\S+)\z/i;
+
+  my $chunk = $1;
+  return undef if uc($chunk) eq 'NOSTR';
+
+  return {
+    chunk => $chunk,
+  };
+}
+
+sub _consume_sasl_chunk {
+  my ($class, %args) = @_;
+  my $state = $args{state} || {};
+  my $chunk = $args{chunk};
+
+  $state->{buffer} .= $chunk
+    unless $chunk eq '+';
+
+  return ()
+    if $chunk ne '+'
+      && length($chunk) == 400;
+
+  return $class->_flush_sasl_chunk_state(%args);
+}
+
+sub _flush_sasl_chunk_state {
+  my ($class, %args) = @_;
+  my $state = $args{state} || {};
+  my $buffer = delete $state->{buffer};
+
+  return ()
+    unless defined($buffer) && length($buffer);
+
+  my $decoded = eval { decode_base64($buffer) };
+  return ()
+    unless defined $decoded;
+
+  my $challenge_payload = eval { JSON::PP::decode_json($decoded) };
+  return ()
+    unless ref($challenge_payload) eq 'HASH';
+
+  return $class->_render_sasl_response(
+    %args,
+    challenge_payload => $challenge_payload,
+  );
+}
+
+sub _render_sasl_response {
+  my ($class, %args) = @_;
+  my $challenge_payload = $args{challenge_payload};
+
+  my $challenge = $challenge_payload->{challenge};
+  my $scope = $challenge_payload->{scope};
+  return ()
+    unless defined($challenge) && !ref($challenge) && length($challenge)
+        && defined($scope) && !ref($scope) && length($scope);
+
+  my %response = (
+    auth_event => $class->_authorize_auth_artifact(
+      %args,
+      scope     => $scope,
+      challenge => $challenge,
+    )->{value},
+  );
+
+  my $delegate_required = grep { exists $challenge_payload->{$_} }
+    qw(relay_url grant_kind delegate_pubkey session_id expires_at);
+  if ($delegate_required) {
+    die "malformed SASL NOSTR challenge payload\n"
+      unless defined($challenge_payload->{relay_url}) && !ref($challenge_payload->{relay_url}) && length($challenge_payload->{relay_url})
+          && defined($challenge_payload->{grant_kind}) && !ref($challenge_payload->{grant_kind}) && length($challenge_payload->{grant_kind})
+          && defined($challenge_payload->{delegate_pubkey}) && !ref($challenge_payload->{delegate_pubkey}) && length($challenge_payload->{delegate_pubkey})
+          && defined($challenge_payload->{session_id}) && !ref($challenge_payload->{session_id}) && length($challenge_payload->{session_id})
+          && defined($challenge_payload->{expires_at}) && !ref($challenge_payload->{expires_at}) && length($challenge_payload->{expires_at});
+
+    $response{delegate_event} = $class->_authorize_delegate_artifact(
+      %args,
+      scope            => $scope,
+      relay_url        => $challenge_payload->{relay_url},
+      grant_kind       => $challenge_payload->{grant_kind},
+      delegate_pubkey  => $challenge_payload->{delegate_pubkey},
+      session_id       => $challenge_payload->{session_id},
+      expires_at       => $challenge_payload->{expires_at},
+    )->{value};
+  }
+
+  my $payload = encode_base64(JSON::PP::encode_json(\%response), '');
+  my $lines = Overnet::Program::IRC::Renderer::authenticate_payload_lines(
+    payload => $payload,
+  );
+
+  return map {
+    $args{quote}
+      ? "/quote $_\n"
+      : "$_\n"
+  } @{$lines};
+}
+
+sub _render_irc_artifact {
+  my ($class, %args) = @_;
+  my $wire = Overnet::Auth::Bridge::IRC->encode_artifact(
+    artifact => $args{artifact},
+    protocol => 'irc',
+    command  => $args{irc_command},
+    encoding => 'base64-json',
+  );
+
+  return $args{quote}
+    ? "/quote $wire->{command} $wire->{payload}\n"
+    : "$wire->{payload}\n";
 }
 
 sub _service_identity_descriptor {

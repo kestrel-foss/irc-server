@@ -26,6 +26,10 @@ like $content, qr/overnet-irc-auth\.pl bridge/,
   'README documents bridge mode';
 like $content, qr/stdin/i,
   'README documents stdin usage for bridge mode';
+like $content, qr/SASL/i,
+  'README documents SASL auth flow';
+like $content, qr/AUTHENTICATE/,
+  'README documents AUTHENTICATE bridge usage';
 like $content, qr/overnet-auth-agent\.pl --config-file/,
   'README documents starting the auth-agent daemon before IRC auth';
 

@@ -5,7 +5,7 @@ use File::Spec;
 use File::Temp qw(tempdir);
 use FindBin;
 use JSON::PP qw(encode_json decode_json);
-use MIME::Base64 qw(decode_base64);
+use MIME::Base64 qw(decode_base64 encode_base64);
 use Socket qw(AF_UNIX PF_UNSPEC SOCK_STREAM);
 use Test::More;
 
@@ -160,6 +160,68 @@ subtest 'helper bridge mode consumes a continuous stream against the daemon' => 
   _wait_for_child($pid, 'daemon exits cleanly after the bridge stream flow');
 };
 
+subtest 'helper bridge mode answers SASL NOSTR AUTHENTICATE challenge streams against the daemon' => sub {
+  my $dir = tempdir(CLEANUP => 1, DIR => File::Spec->catdir($FindBin::Bin, '..'));
+  my $config_file = File::Spec->catfile($dir, 'auth-agent.json');
+  my $socket_path = File::Spec->catfile($dir, 'auth.sock');
+
+  _write_config($config_file, $socket_path);
+  my ($pid, $next_socket) = _start_daemon_from_config(
+    config_file     => $config_file,
+    endpoint        => $socket_path,
+    max_connections => 2,
+  );
+
+  my $bridge_client = Overnet::Auth::Client->new(
+    endpoint       => $socket_path,
+    socket_factory => $next_socket,
+  );
+  my $input = _authenticate_input_lines({
+    challenge        => $challenge,
+    scope            => $scope,
+    relay_url        => 'ws://127.0.0.1:7448',
+    grant_kind       => 14142,
+    delegate_pubkey  => ('f' x 64),
+    session_id       => 'session-123',
+    expires_at       => '1744304600',
+    padding          => ('x' x 700),
+  });
+  my $output = '';
+  open my $in, '<', \$input or die "open input failed: $!";
+  open my $out, '>', \$output or die "open output failed: $!";
+
+  my $count = Overnet::Program::IRC::Auth::Helper->run(
+    client      => $bridge_client,
+    command     => 'bridge',
+    input       => $in,
+    output      => $out,
+    interactive => 1,
+    quote       => 1,
+  );
+
+  close $out or die "close output failed: $!";
+  my @lines = grep { length } split /\n/, $output;
+  ok @lines >= 1, 'sasl bridge emitted AUTHENTICATE commands';
+  is $count, scalar(@lines), 'sasl bridge count matches emitted AUTHENTICATE commands';
+  like $lines[0], qr{\A/quote AUTHENTICATE \S+\z},
+    'sasl bridge emits IRC AUTHENTICATE commands';
+
+  my $response = _decode_authenticate_output($output);
+  is $response->{auth_event}{kind}, 22242, 'sasl bridge returned an auth event';
+  is $response->{delegate_event}{kind}, 14142, 'sasl bridge returned a delegate event';
+  is $response->{auth_event}{tags}[0][1], $scope, 'sasl auth event preserves the scope';
+  is $response->{auth_event}{tags}[1][1], $challenge, 'sasl auth event preserves the challenge';
+  is_deeply $response->{delegate_event}{tags}, [
+    [ relay => 'ws://127.0.0.1:7448' ],
+    [ server => $scope ],
+    [ delegate => ('f' x 64) ],
+    [ session => 'session-123' ],
+    [ expires_at => '1744304600' ],
+  ], 'sasl delegate event preserves the server challenge parameters';
+
+  _wait_for_child($pid, 'daemon exits cleanly after the sasl bridge flow');
+};
+
 done_testing;
 
 sub _start_daemon_from_config {
@@ -245,4 +307,31 @@ sub _write_config {
     or die "write $path failed: $!";
   close $fh
     or die "close $path failed: $!";
+}
+
+sub _authenticate_input_lines {
+  my ($payload) = @_;
+  my $encoded = encode_base64(encode_json($payload), '');
+  my @chunks;
+  while (length($encoded) > 400) {
+    push @chunks, substr($encoded, 0, 400, '');
+  }
+  push @chunks, $encoded if length $encoded;
+
+  return join '', map { ":server AUTHENTICATE $_\r\n" } @chunks;
+}
+
+sub _decode_authenticate_output {
+  my ($output) = @_;
+  my $payload = join '',
+    map {
+      my $line = $_;
+      $line =~ s/\A\/quote\s+//;
+      $line =~ s/\AAUTHENTICATE\s+//;
+      $line eq '+' ? () : $line;
+    }
+    grep { length }
+    split /\n/, $output;
+
+  return decode_json(decode_base64($payload));
 }
