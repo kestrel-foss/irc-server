@@ -339,7 +339,7 @@ HELP
 sub _usage {
   return <<'USAGE';
 Usage:
-  /opt/perl-5.42/bin/perl irc-server/bin/overnet-irc-chat-client.pl --nick NICK [options]
+  perl irc-server/bin/overnet-irc-chat-client.pl --nick NICK [options]
 
 Options:
   --host HOST        IRC server host (default: 127.0.0.1)
