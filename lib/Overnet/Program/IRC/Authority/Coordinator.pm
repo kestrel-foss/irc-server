@@ -356,9 +356,6 @@ sub load_authoritative_nip29_events {
   return [] unless defined $canonical;
 
   if ($server->_authority_relay_enabled) {
-    my $subscription_ids = ensure_authoritative_channel_subscription($server, $canonical);
-    return [] unless ref($subscription_ids) eq 'ARRAY' && @{$subscription_ids};
-
     if ($args{refresh}) {
       my (undef, $group_id) = $server->_authoritative_group_binding($canonical);
       return [] unless defined $group_id;
@@ -396,6 +393,9 @@ sub load_authoritative_nip29_events {
 
       return \@events;
     }
+
+    my $subscription_ids = ensure_authoritative_channel_subscription($server, $canonical);
+    return [] unless ref($subscription_ids) eq 'ARRAY' && @{$subscription_ids};
 
     my @events;
     my %seen_ids;

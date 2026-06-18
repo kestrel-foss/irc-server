@@ -378,6 +378,8 @@ sub handle_join {
   );
   $server->_send_join_bootstrap($client_id, $channel);
   $server->_ensure_channel_subscription($channel);
+  $server->_ensure_authoritative_channel_subscription($channel)
+    if $server->_authority_relay_enabled && $server->_is_authoritative_channel($channel);
   if (!$server->_is_authoritative_channel($channel)) {
     $server->_emit_client_input(
       $client,
