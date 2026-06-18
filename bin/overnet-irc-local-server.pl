@@ -169,8 +169,8 @@ if (defined $tls_config) {
 }
 print "\n";
 print "Open two more terminals and run:\n";
-print "  /opt/perl-5.42/bin/perl $client_script --nick alice --port $ready_details->{listen_port}" . (defined $tls_config ? ' --tls --tls-no-verify' : '') . "\n";
-print "  /opt/perl-5.42/bin/perl $client_script --nick bob --port $ready_details->{listen_port}" . (defined $tls_config ? ' --tls --tls-no-verify' : '') . "\n";
+print "  $^X $client_script --nick alice --port $ready_details->{listen_port}" . (defined $tls_config ? ' --tls --tls-no-verify' : '') . "\n";
+print "  $^X $client_script --nick bob --port $ready_details->{listen_port}" . (defined $tls_config ? ' --tls --tls-no-verify' : '') . "\n";
 print "\n";
 print "The client auto-joins #overnet. Plain text sends to the current target.\n";
 if (defined $tls_config) {
@@ -347,7 +347,7 @@ sub _shell_quote {
 sub _usage {
   return <<'USAGE';
 Usage:
-  /opt/perl-5.42/bin/perl irc-server/bin/overnet-irc-local-server.pl [options]
+  perl irc-server/bin/overnet-irc-local-server.pl [options]
 
 Options:
   --adapter-id ID         Adapter id to register and use (default: irc.local)
