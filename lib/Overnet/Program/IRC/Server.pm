@@ -2504,9 +2504,14 @@ sub _authoritative_join_admission_for_client {
   my $pubkey = $self->_client_authoritative_pubkey($client);
   my $actor_mask = $self->_authoritative_irc_mask_for_client($client);
   my $join_key = $args{join_key};
-  my $events = $self->_read_authoritative_nip29_events($channel);
+  my $canonical = $self->_canonical_channel_name($channel);
+  my $cache = defined $canonical ? $self->{authoritative_channel_cache}{$canonical} : undef;
+  my $events = $self->_authority_relay_enabled
+      && !(ref($cache) eq 'HASH' && ref($cache->{events}) eq 'ARRAY')
+    ? $self->_read_authoritative_nip29_events($channel, force => 1)
+    : $self->_read_authoritative_nip29_events($channel);
   $events = $self->_read_authoritative_nip29_events($channel, force => 1)
-    if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled;
+    if ref($events) eq 'ARRAY' && !@{$events} && $self->_authority_relay_enabled && ref($cache) eq 'HASH';
   if (ref($events) eq 'ARRAY' && !@{$events}) {
     if ($self->_authoritative_channel_is_known($channel)) {
       return {
