@@ -81,6 +81,7 @@ sub run {
   binmode(STDERR, ':raw');
   STDOUT->autoflush(1);
   STDERR->autoflush(1);
+  $SIG{PIPE} = 'IGNORE';
 
   $self->_send_message(
     Overnet::Program::Protocol::build_program_hello(
