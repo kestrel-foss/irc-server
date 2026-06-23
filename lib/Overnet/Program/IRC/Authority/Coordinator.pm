@@ -2,6 +2,8 @@ package Overnet::Program::IRC::Authority::Coordinator;
 
 use strict;
 use warnings;
+
+use constant MAX_RENDERED_SUBSCRIPTION_EVENT_IDS => 4096;
 use Overnet::Authority::HostedChannel;
 
 our $VERSION = '0.001';
@@ -597,6 +599,9 @@ sub handle_subscription_event {
   if (defined $data->{id} && delete $server->{suppress_subscription_event_ids}{$data->{id}}) {
     return 0;
   }
+  if (defined $data->{id} && $server->{rendered_subscription_event_ids}{$data->{id}}) {
+    return 0;
+  }
 
   my $render = $server->_render_subscription_item(
     item_type => $params->{item_type},
@@ -604,11 +609,19 @@ sub handle_subscription_event {
   );
   return 0 unless $render;
 
+  _remember_rendered_subscription_event_id($server, $data->{id});
+
+  my $originating_client_id = defined $data->{id}
+    ? delete $server->{subscription_event_origin_client_ids}{$data->{id}}
+    : undef;
+  my $sent = 0;
   for my $client_id (@{$render->{client_ids}}) {
+    next if defined $originating_client_id && $client_id eq $originating_client_id;
     $server->_send_client_line($client_id, $render->{line});
+    $sent++;
   }
 
-  return scalar @{$render->{client_ids}};
+  return $sent;
 }
 
 sub handle_nostr_subscription_event {
@@ -619,6 +632,9 @@ sub handle_nostr_subscription_event {
   return 0 unless defined $subscription_id && !ref($subscription_id) && length($subscription_id);
 
   if (defined $params->{data}{id} && delete $server->{suppress_subscription_event_ids}{$params->{data}{id}}) {
+    return 0;
+  }
+  if (defined $params->{data}{id} && $server->{rendered_subscription_event_ids}{$params->{data}{id}}) {
     return 0;
   }
 
@@ -633,10 +649,33 @@ sub handle_nostr_subscription_event {
 
   my $channel = $server->{authoritative_subscription_channels}{$subscription_id};
   return 0 unless defined $channel;
-  return $server->_update_authoritative_channel_cache_with_event(
+  my $updated = $server->_update_authoritative_channel_cache_with_event(
     channel => $channel,
     event   => $params->{data},
   );
+  _remember_rendered_subscription_event_id($server, $params->{data}{id})
+    if $updated;
+  return $updated;
+}
+
+sub _remember_rendered_subscription_event_id {
+  my ($server, $event_id) = @_;
+  return 0 unless defined $event_id && !ref($event_id) && length($event_id);
+
+  $server->{rendered_subscription_event_ids} ||= {};
+  return 1 if $server->{rendered_subscription_event_ids}{$event_id};
+
+  $server->{rendered_subscription_event_ids}{$event_id} = 1;
+  $server->{rendered_subscription_event_id_order} ||= [];
+  push @{$server->{rendered_subscription_event_id_order}}, $event_id;
+
+  while (@{$server->{rendered_subscription_event_id_order}} > MAX_RENDERED_SUBSCRIPTION_EVENT_IDS) {
+    my $expired = shift @{$server->{rendered_subscription_event_id_order}};
+    delete $server->{rendered_subscription_event_ids}{$expired}
+      if defined $expired;
+  }
+
+  return 1;
 }
 
 sub reconcile_authoritative_pending_invites_from_refresh {
