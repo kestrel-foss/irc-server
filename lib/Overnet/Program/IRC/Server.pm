@@ -53,6 +53,9 @@ sub new {
     channels                    => {},
     nick_to_client_id           => {},
     suppress_subscription_event_ids => {},
+    subscription_event_origin_client_ids => {},
+    rendered_subscription_event_ids => {},
+    rendered_subscription_event_id_order => [],
     authoritative_last_created_at => {},
     authoritative_delegate_sequences => {},
     authoritative_subscription_channels => {},
@@ -4042,7 +4045,10 @@ sub _update_authoritative_channel_cache_with_event {
   my $new_cache;
   if (ref($cache->{events}) eq 'ARRAY') {
     my @events = @{$cache->{events}};
-    if (!defined($event_id) || !grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $event_id } @events) {
+    my $already_cached = defined($event_id)
+      ? grep { ref($_) eq 'HASH' && defined($_->{id}) && $_->{id} eq $event_id } @events
+      : 0;
+    if (!$already_cached) {
       push @events, $event;
     }
     my $sorted_events = $self->_sort_authoritative_events(\@events);
@@ -4054,6 +4060,7 @@ sub _update_authoritative_channel_cache_with_event {
       state        => $self->_authoritative_channel_state_from_view($new_view),
       refreshed_at => time(),
     };
+    return 1 if $already_cached;
   } else {
     my $sorted_events = $self->_sort_authoritative_events([$event]);
     my $new_view = $self->_derive_authoritative_channel_view_from_events($canonical, $sorted_events);
@@ -4784,6 +4791,12 @@ sub _emit_mapped_result {
     my %tags = $self->_first_tag_values($signed->{tags});
     if ($suppress->{$tags{overnet_et} || ''}) {
       $self->{suppress_subscription_event_ids}{$signed->{id}} = 1;
+    }
+    if (defined $originating_client_id
+        && ($tags{overnet_ot} || '') eq 'chat.channel'
+        && (($tags{overnet_et} || '') eq 'chat.message'
+          || ($tags{overnet_et} || '') eq 'chat.notice')) {
+      $self->{subscription_event_origin_client_ids}{$signed->{id}} = $originating_client_id;
     }
     $self->_request(
       method => 'overnet.emit_event',
