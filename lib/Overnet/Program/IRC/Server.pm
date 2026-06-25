@@ -3,6 +3,7 @@ package Overnet::Program::IRC::Server;
 use strict;
 use warnings;
 use Digest::SHA qw(sha256_hex);
+use Encode qw(encode);
 use IO::Handle;
 use IO::Select;
 use IO::Socket::INET;
@@ -5548,7 +5549,7 @@ sub _send_client_line {
     or return 0;
 
   $line = $self->_decorate_outbound_line_for_client($client, $line);
-  my $payload = $line . "\r\n";
+  my $payload = encode('UTF-8', $line . "\r\n", Encode::FB_CROAK);
   my $offset = 0;
   while ($offset < length $payload) {
     my $written = syswrite($client->{socket}, $payload, length($payload) - $offset, $offset);

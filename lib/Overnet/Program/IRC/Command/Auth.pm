@@ -454,7 +454,7 @@ sub _send_account_notify {
     account => $new_account,
   );
 
-  for my $recipient_id (sort { $a <=> $b } keys %recipient_ids) {
+  for my $recipient_id (sort keys %recipient_ids) {
     $server->_send_client_line($recipient_id, $line);
   }
 
